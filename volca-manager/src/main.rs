@@ -3,7 +3,7 @@ slint::include_modules!();
 mod midi;
 
 use midi::MidiDevice;
-use slint::{Model, VecModel, SharedString, SharedPixelBuffer, Rgba8Pixel, Image};
+use slint::{Model, VecModel, SharedString};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -11,79 +11,79 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Render audio samples to a waveform image
-fn render_waveform(samples: &[i16], width: u32, height: u32) -> Image {
-    let mut pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-    let pixels = pixel_buffer.make_mut_bytes();
-
-    // Colors (RGBA)
-    let bg_color = [0x0d, 0x0d, 0x1a, 0xff];       // Dark blue background
-    let wave_color = [0x4a, 0x90, 0xe2, 0xff];     // Blue waveform
-    let wave_fill = [0x4a, 0x90, 0xe2, 0x40];      // Semi-transparent fill
-
-    // Fill background
-    for y in 0..height {
-        for x in 0..width {
-            let idx = ((y * width + x) * 4) as usize;
-            pixels[idx..idx + 4].copy_from_slice(&bg_color);
-        }
-    }
-
+/// Generate SVG path commands for waveform display (envelope style)
+/// Uses viewbox coordinates: x in [0, 1000], y in [0, 200] where y=100 is center
+/// Creates a filled envelope showing min/max values at each point
+fn generate_waveform_path(samples: &[i16], num_points: usize) -> String {
     if samples.is_empty() {
-        return Image::from_rgba8(pixel_buffer);
+        return String::from("M 0 100 L 1000 100 L 1000 100 L 0 100 Z");
     }
 
-    let center_y = height as i32 / 2;
-    let max_amplitude = height as i32 / 2 - 2;
+    let num_points = num_points.max(2);  // Need at least 2 points
 
-    // Calculate samples per pixel (for downsampling)
-    let samples_per_pixel = samples.len() as f64 / width as f64;
+    // We'll draw the upper envelope forward, then lower envelope backward to create a filled shape
+    let mut upper_points: Vec<(f64, f64)> = Vec::with_capacity(num_points);
+    let mut lower_points: Vec<(f64, f64)> = Vec::with_capacity(num_points);
 
-    for x in 0..width {
-        // Find min/max sample values for this pixel column
-        let start_sample = (x as f64 * samples_per_pixel) as usize;
-        let end_sample = ((x as f64 + 1.0) * samples_per_pixel) as usize;
-        let end_sample = end_sample.min(samples.len());
+    for i in 0..num_points {
+        // Map i to sample range
+        let t = i as f64 / (num_points - 1) as f64;  // 0.0 to 1.0
+        let center_idx = (t * (samples.len() - 1) as f64) as usize;
 
-        if start_sample >= samples.len() {
-            break;
-        }
+        // Sample a window around this position
+        let window_size = (samples.len() / num_points).max(1);
+        let start_idx = center_idx.saturating_sub(window_size / 2);
+        let end_idx = (start_idx + window_size).min(samples.len());
 
+        // Find min/max sample values in this window
         let mut min_val: i16 = i16::MAX;
         let mut max_val: i16 = i16::MIN;
-
-        for i in start_sample..end_sample {
-            let s = samples[i];
+        for j in start_idx..end_idx {
+            let s = samples[j];
             min_val = min_val.min(s);
             max_val = max_val.max(s);
         }
 
-        // Convert to pixel coordinates
-        let y_min = center_y - (max_val as i32 * max_amplitude / i16::MAX as i32);
-        let y_max = center_y - (min_val as i32 * max_amplitude / i16::MAX as i32);
+        // Convert to viewbox coordinates
+        // x: 0 to 1000 (full width, guaranteed)
+        // y: 0 (top, +1.0) to 200 (bottom, -1.0), center at 100
+        let x = t * 1000.0;
+        let y_max = 100.0 - (max_val as f64 / i16::MAX as f64) * 98.0;
+        let y_min = 100.0 - (min_val as f64 / i16::MAX as f64) * 98.0;
 
-        let y_min = y_min.max(0).min(height as i32 - 1) as u32;
-        let y_max = y_max.max(0).min(height as i32 - 1) as u32;
-
-        // Draw vertical line for this sample range (filled area)
-        for y in y_min..=y_max {
-            let idx = ((y * width + x) * 4) as usize;
-            // Use fill color for the body
-            pixels[idx..idx + 4].copy_from_slice(&wave_fill);
-        }
-
-        // Draw the outline at min and max
-        if y_min < height {
-            let idx = ((y_min * width + x) * 4) as usize;
-            pixels[idx..idx + 4].copy_from_slice(&wave_color);
-        }
-        if y_max < height && y_max != y_min {
-            let idx = ((y_max * width + x) * 4) as usize;
-            pixels[idx..idx + 4].copy_from_slice(&wave_color);
-        }
+        upper_points.push((x, y_max));
+        lower_points.push((x, y_min));
     }
 
-    Image::from_rgba8(pixel_buffer)
+    // Build path: upper envelope forward, then lower envelope backward
+    let mut path = String::with_capacity(num_points * 40);
+
+    // Start at x=0 with first point
+    path.push_str(&format!("M 0 {:.1}", upper_points.first().map(|p| p.1).unwrap_or(100.0)));
+
+    // Draw upper envelope
+    for &(x, y) in upper_points.iter() {
+        path.push_str(&format!(" L {:.1} {:.1}", x, y));
+    }
+
+    // Ensure we reach x=1000
+    if let Some(&(_, y)) = upper_points.last() {
+        path.push_str(&format!(" L 1000 {:.1}", y));
+    }
+
+    // Draw lower envelope in reverse
+    if let Some(&(_, y)) = lower_points.last() {
+        path.push_str(&format!(" L 1000 {:.1}", y));
+    }
+    for &(x, y) in lower_points.iter().rev() {
+        path.push_str(&format!(" L {:.1} {:.1}", x, y));
+    }
+
+    // Close back to start
+    path.push_str(&format!(" L 0 {:.1}", lower_points.first().map(|p| p.1).unwrap_or(100.0)));
+    path.push_str(" Z");
+
+    path
 }
 
 pub struct AppState {
@@ -677,21 +677,19 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                 if let Some((audio_data, _speed)) = state_select.downloaded_samples.borrow().get(&(slot as u8)) {
                     state_select.log(format!("Selected slot {}: {} ({} samples)", slot, sample.name, audio_data.len()));
 
-                    // Render waveform image (use fixed size, will be scaled by UI)
-                    let waveform_image = render_waveform(audio_data, 1200, 200);
-                    ui.set_waveform_image(waveform_image);
+                    // Generate SVG path for waveform (1000 points for smooth display)
+                    let waveform_path = generate_waveform_path(audio_data, 1000);
+                    ui.set_waveform_path(SharedString::from(waveform_path));
                 } else {
                     state_select.log(format!("Selected slot {}: {} (not downloaded)", slot, sample.name));
-                    // Clear waveform - render empty
-                    let empty_waveform = render_waveform(&[], 1200, 200);
-                    ui.set_waveform_image(empty_waveform);
+                    // Clear waveform path
+                    ui.set_waveform_path(SharedString::from(""));
                 }
             } else {
                 ui.set_selected_sample_name(slint::SharedString::from("Empty slot"));
                 ui.set_selected_sample_length(0);
-                // Clear waveform
-                let empty_waveform = render_waveform(&[], 1200, 200);
-                ui.set_waveform_image(empty_waveform);
+                // Clear waveform path
+                ui.set_waveform_path(SharedString::from(""));
             }
         }
 
