@@ -508,4 +508,59 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         println!("DEBUG: current show_debug_log = {}, setting to {}", current, !current);
         ui.set_show_debug_log(!current);
     });
+
+    // Pad selection callback - select a sample to view its waveform
+    let state_select = state.clone();
+    ui.on_pad_selected(move |slot| {
+        println!("Pad selected: slot {}", slot);
+        let ui = state_select.ui.upgrade().unwrap();
+        ui.set_selected_slot(slot);
+
+        // Get sample info for the selected slot
+        if let Some(sample) = state_select.get_sample(slot) {
+            if sample.has_sample {
+                ui.set_selected_sample_name(sample.name.clone());
+                ui.set_selected_sample_length(sample.length as i32);
+                state_select.log(format!("Selected slot {}: {}", slot, sample.name));
+            } else {
+                ui.set_selected_sample_name(slint::SharedString::from("Empty slot"));
+                ui.set_selected_sample_length(0);
+            }
+        }
+
+        // Reset zoom and scroll when selecting a new sample
+        ui.set_waveform_zoom(1.0);
+        ui.set_waveform_scroll(0.0);
+    });
+
+    // Waveform zoom callbacks
+    let ui_weak_zoom_in = ui_weak.clone();
+    ui.on_waveform_zoom_in(move || {
+        let ui = ui_weak_zoom_in.unwrap();
+        let current_zoom = ui.get_waveform_zoom();
+        let new_zoom = (current_zoom * 1.5).min(10.0); // Max 10x zoom
+        ui.set_waveform_zoom(new_zoom);
+        println!("Zoom in: {}%", (new_zoom * 100.0) as i32);
+    });
+
+    let ui_weak_zoom_out = ui_weak.clone();
+    ui.on_waveform_zoom_out(move || {
+        let ui = ui_weak_zoom_out.unwrap();
+        let current_zoom = ui.get_waveform_zoom();
+        let new_zoom = (current_zoom / 1.5).max(1.0); // Min 1x zoom
+        ui.set_waveform_zoom(new_zoom);
+        // Reset scroll if we can see the whole waveform
+        if new_zoom <= 1.0 {
+            ui.set_waveform_scroll(0.0);
+        }
+        println!("Zoom out: {}%", (new_zoom * 100.0) as i32);
+    });
+
+    let ui_weak_zoom_reset = ui_weak.clone();
+    ui.on_waveform_zoom_reset(move || {
+        let ui = ui_weak_zoom_reset.unwrap();
+        ui.set_waveform_zoom(1.0);
+        ui.set_waveform_scroll(0.0);
+        println!("Zoom reset");
+    });
 }
