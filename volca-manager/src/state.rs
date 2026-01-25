@@ -18,7 +18,9 @@ impl AppState {
                 slot: i,
                 name: SharedString::from(""),
                 length: 0,
+                speed: 0,
                 has_sample: false,
+                name_edited: false,
             });
         }
 
@@ -55,7 +57,9 @@ impl AppState {
                 slot,
                 name: SharedString::from(name),
                 length,
+                speed: 16384,  // Default speed
                 has_sample: true,
+                name_edited: false,
             });
         }
     }

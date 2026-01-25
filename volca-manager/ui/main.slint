@@ -1,4 +1,4 @@
-import { Button, VerticalBox, HorizontalBox, ScrollView, GridBox, TextEdit, Slider } from "std-widgets.slint";
+import { Button, VerticalBox, HorizontalBox, ScrollView, GridBox, TextEdit, Slider, LineEdit } from "std-widgets.slint";
 
 export struct SampleInfo {
     slot: int,
@@ -6,6 +6,7 @@ export struct SampleInfo {
     length: int,
     speed: int,
     has-sample: bool,
+    name-edited: bool,
 }
 
 // Waveform viewer component
@@ -231,10 +232,29 @@ component SamplePad inherits Rectangle {
     in property <SampleInfo> sample;
     in property <bool> selected: false;
     in property <bool> is-loading: false;
+    in property <int> current-page: 0;
+    in-out property <bool> is-editing: false;
+    in-out property <string> edited-name: "";
     callback upload-clicked();
     callback download-clicked();
     callback delete-clicked();
     callback pad-clicked();
+    callback name-edit-accepted(string);
+    callback save-clicked();
+
+    // Exit edit mode when pad is deselected
+    changed selected => {
+        if !selected && is-editing {
+            is-editing = false;
+        }
+    }
+
+    // Exit edit mode when page changes
+    changed current-page => {
+        if is-editing {
+            is-editing = false;
+        }
+    }
 
     border-radius: 8px;
     border-width: selected ? 3px : 2px;
@@ -251,7 +271,7 @@ component SamplePad inherits Rectangle {
         spacing: 3px;
         alignment: stretch;
 
-        // Slot number with loading indicator
+        // Slot number with loading indicator and unsaved edit indicator
         HorizontalLayout {
             alignment: center;
             spacing: 4px;
@@ -264,6 +284,12 @@ component SamplePad inherits Rectangle {
                 horizontal-alignment: center;
             }
 
+            if sample.name-edited: Text {
+                text: "✏️";
+                font-size: 10px;
+                horizontal-alignment: center;
+            }
+
             if is-loading: Text {
                 text: "⏳";
                 font-size: 12px;
@@ -271,14 +297,41 @@ component SamplePad inherits Rectangle {
             }
         }
 
-        // Sample name or empty indicator
-        Text {
-            text: sample.has-sample ? sample.name : "(empty)";
+        // Sample name - editable or display
+        if is-editing && sample.has-sample: LineEdit {
+            text <=> edited-name;
             font-size: 11px;
-            font-weight: sample.has-sample ? 600 : 400;
-            color: sample.has-sample ? #333 : #999;
-            overflow: elide;
             horizontal-alignment: center;
+            edited => {
+                // Prevent typing beyond 24 characters
+                if (self.text.character-count > 24) {
+                    self.text = edited-name;  // Reject the change, revert to last valid value
+                } else {
+                    edited-name = self.text;  // Accept the change
+                }
+            }
+            accepted => {
+                root.is-editing = false;
+                root.name-edit-accepted(edited-name);
+            }
+        }
+
+        if !is-editing: TouchArea {
+            clicked => {
+                if sample.has-sample {
+                    root.is-editing = true;
+                    root.edited-name = sample.name;
+                }
+            }
+
+            Text {
+                text: sample.has-sample ? sample.name : "(empty)";
+                font-size: 11px;
+                font-weight: sample.has-sample ? 600 : 400;
+                color: sample.has-sample ? #333 : #999;
+                overflow: elide;
+                horizontal-alignment: center;
+            }
         }
 
         // Length display (rounded to 1 decimal place)
@@ -308,6 +361,14 @@ component SamplePad inherits Rectangle {
         HorizontalLayout {
             spacing: 4px;
             alignment: center;
+
+            if sample.has-sample: Button {
+                text: "💾";
+                clicked => {
+                    root.is-editing = false;
+                    save-clicked();
+                }
+            }
 
             if sample.has-sample: Button {
                 text: "🔄";
@@ -340,6 +401,10 @@ export component AppWindow inherits Window {
     callback upload-clicked(int);
     callback download-clicked(int);
     callback delete-clicked(int);
+    callback name-edit-accepted(int, string);
+    callback save-to-device-clicked(int);
+    callback clear-name-edited-flag(int);
+    callback update-sample-from-device(int, string, int, int);  // slot, name, length, speed
     callback prev-page-clicked();
     callback next-page-clicked();
     callback toggle-debug-log();
@@ -466,10 +531,13 @@ export component AppWindow inherits Window {
                         height: 120px;
                         selected: selected-slot == samples[start-slot + i].slot;
                         is-loading: loading-slot == samples[start-slot + i].slot;
+                        current-page: current-page;
                         upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                         download-clicked => { download-clicked(samples[start-slot + i].slot); }
                         delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
                         pad-clicked => { pad-selected(samples[start-slot + i].slot); }
+                        name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
+                        save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
                     }
                 }
 
@@ -483,10 +551,13 @@ export component AppWindow inherits Window {
                         height: 120px;
                         selected: selected-slot == samples[start-slot + i].slot;
                         is-loading: loading-slot == samples[start-slot + i].slot;
+                        current-page: current-page;
                         upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                         download-clicked => { download-clicked(samples[start-slot + i].slot); }
                         delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
                         pad-clicked => { pad-selected(samples[start-slot + i].slot); }
+                        name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
+                        save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
                     }
                 }
             }

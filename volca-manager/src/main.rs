@@ -154,6 +154,7 @@ impl AppState {
                 length: 0,
                 speed: 0,
                 has_sample: false,
+                name_edited: false,
             });
         }
 
@@ -202,6 +203,7 @@ impl AppState {
                             length: header.length as i32,
                             speed: header.speed as i32,
                             has_sample,
+                            name_edited: false,
                         });
 
                         // Update UI periodically
@@ -218,6 +220,7 @@ impl AppState {
                             length: 0,
                             speed: 0,
                             has_sample: false,
+                            name_edited: false,
                         });
                     }
                 }
@@ -536,12 +539,23 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                                     (audio_data_clone.clone(), header.speed)
                                 );
 
-                                // Update UI on main thread
+                                // Update UI on main thread with fresh sample info
                                 let waveform_data = audio_data_clone.clone();
+                                let header_name = header.name.clone();
+                                let header_length = header.length;
+                                let header_speed = header.speed;
                                 println!("✓ Refreshed in {:.3}s", elapsed.as_secs_f64());
                                 let ui_weak_clone = ui_weak.clone();
                                 slint::invoke_from_event_loop(move || {
                                     if let Some(ui) = ui_weak_clone.upgrade() {
+                                        // Update SampleInfo with fresh data from device (clears any unsaved edits)
+                                        ui.invoke_update_sample_from_device(
+                                            slot,
+                                            SharedString::from(header_name),
+                                            header_length as i32,
+                                            header_speed as i32
+                                        );
+
                                         // Generate and display waveform
                                         let width = ui.get_waveform_display_width();
                                         let height = ui.get_waveform_display_height();
@@ -830,7 +844,6 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                     // Regenerate waveform with new dimensions
                     let waveform_path = generate_waveform_path(&audio_data, 1000, width as f64, height as f64);
                     ui.set_waveform_path(SharedString::from(waveform_path));
-                    println!("Regenerated waveform: {}x{}", width, height);
                 }
             }
         }
@@ -843,7 +856,6 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         let current_zoom = ui.get_waveform_zoom();
         let new_zoom = (current_zoom * 1.5).min(10.0); // Max 10x zoom
         ui.set_waveform_zoom(new_zoom);
-        println!("Zoom in: {}%", (new_zoom * 100.0) as i32);
     });
 
     let ui_weak_zoom_out = ui_weak.clone();
@@ -856,7 +868,6 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         if new_zoom <= 1.0 {
             ui.set_waveform_scroll(0.0);
         }
-        println!("Zoom out: {}%", (new_zoom * 100.0) as i32);
     });
 
     let ui_weak_zoom_reset = ui_weak.clone();
@@ -864,6 +875,224 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         let ui = ui_weak_zoom_reset.unwrap();
         ui.set_waveform_zoom(1.0);
         ui.set_waveform_scroll(0.0);
-        println!("Zoom reset");
+    });
+
+    // Name edit accepted callback - update name and set edited flag
+    let state_name_edit = state.clone();
+    ui.on_name_edit_accepted(move |slot, new_name| {
+        let new_name_str = new_name.to_string();
+
+        state_name_edit.log(format!("Name edited for slot {}: \"{}\" (not yet saved)", slot, new_name_str));
+
+        // Update UI with new name and set edited flag
+        if let Some(mut sample) = state_name_edit.get_sample(slot) {
+            sample.name = SharedString::from(&new_name_str);
+            sample.name_edited = true;
+            state_name_edit.samples.set_row_data(slot as usize, sample);
+
+            // Update UI
+            if let Some(ui) = state_name_edit.ui.upgrade() {
+                ui.set_samples(state_name_edit.samples.clone().into());
+            }
+        }
+    });
+
+    // Clear name edited flag callback - called from background thread via invoke_from_event_loop
+    let state_clear_flag = state.clone();
+    ui.on_clear_name_edited_flag(move |slot| {
+        if let Some(mut sample) = state_clear_flag.get_sample(slot) {
+            sample.name_edited = false;
+            state_clear_flag.samples.set_row_data(slot as usize, sample);
+
+            if let Some(ui) = state_clear_flag.ui.upgrade() {
+                ui.set_samples(state_clear_flag.samples.clone().into());
+            }
+        }
+    });
+
+    // Update sample from device callback - used after refresh to sync with device state
+    let state_update_sample = state.clone();
+    ui.on_update_sample_from_device(move |slot, name, length, speed| {
+        let updated_info = SampleInfo {
+            slot,
+            name,
+            length,
+            speed,
+            has_sample: true,
+            name_edited: false,  // Clear edited flag when refreshing from device
+        };
+        state_update_sample.samples.set_row_data(slot as usize, updated_info);
+
+        if let Some(ui) = state_update_sample.ui.upgrade() {
+            ui.set_samples(state_update_sample.samples.clone().into());
+        }
+    });
+
+    // Save to device callback - write SampleHeader back to device
+    let state_save = state.clone();
+    let ui_weak_save = ui_weak.clone();
+    ui.on_save_to_device_clicked(move |slot| {
+        // Get current sample info
+        let sample = match state_save.get_sample(slot) {
+            Some(s) if s.has_sample => s,
+            _ => {
+                state_save.log(format!("Cannot save slot {}: no sample exists", slot));
+                return;
+            }
+        };
+
+        let ui = ui_weak_save.unwrap();
+
+        // Set loading state BEFORE starting save
+        ui.set_loading_slot(slot);
+        state_save.log(format!("Saving sample info for slot {}: \"{}\"...", slot, sample.name));
+
+        // Spawn background thread for save operation
+        let device_ref = state_save.device.clone();
+        let downloaded_ref = state_save.downloaded_samples.clone();
+        let ui_weak = state_save.ui.clone();
+        let sample_name = sample.name.to_string();
+        let sample_length = sample.length as u32;
+        let sample_speed = sample.speed as u16;
+
+        std::thread::spawn(move || {
+            use std::time::{Instant, Duration};
+            use volsa2_core::proto::{SampleHeader, SampleData, Status};
+
+            let start_time = Instant::now();
+
+            // Check if sample is downloaded (need audio data to persist name change)
+            let audio_data = match downloaded_ref.lock().unwrap().get(&(slot as u8)) {
+                Some((data, _)) => data.clone(),
+                None => {
+                    println!("ERROR: Sample not downloaded. Download first before saving name changes.");
+                    let ui_weak_clone = ui_weak.clone();
+                    slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_weak_clone.upgrade() {
+                            ui.set_loading_slot(-1);
+                        }
+                    }).ok();
+                    return;
+                }
+            };
+
+            // Get device and send both header and data
+            let mut device_guard = device_ref.lock().unwrap();
+            if let Some(device) = device_guard.as_mut() {
+                // Create SampleHeader with updated name
+                let header = SampleHeader {
+                    sample_no: slot as u8,
+                    name: sample_name.clone(),
+                    length: sample_length,
+                    level: 65535,  // SampleHeader::DEFAULT_LEVEL
+                    speed: sample_speed,
+                };
+
+                // Create SampleData with unchanged audio
+                let data = SampleData {
+                    sample_no: slot as u8,
+                    data: audio_data,
+                };
+
+                // Send header and wait for ACK, then data and wait for ACK
+                match device.send_message(&header) {
+                    Ok(()) => {
+                        // Wait for ACK after header
+                        match device.receive_message::<Status>(Duration::from_millis(500)) {
+                            Ok(status) => {
+                                if let Err(e) = status {
+                                    println!("✗ Device NAK after header: {}", e);
+                                    let ui_weak_clone = ui_weak.clone();
+                                    slint::invoke_from_event_loop(move || {
+                                        if let Some(ui) = ui_weak_clone.upgrade() {
+                                            ui.set_loading_slot(-1);
+                                        }
+                                    }).ok();
+                                    return;
+                                }
+
+                                // Header ACK received, now send data
+                                match device.send_message(&data) {
+                                    Ok(()) => {
+                                        // Wait for ACK after data
+                                        match device.receive_message::<Status>(Duration::from_millis(500)) {
+                                            Ok(status) => {
+                                                if let Err(e) = status {
+                                                    println!("✗ Device NAK after data: {}", e);
+                                                    let ui_weak_clone = ui_weak.clone();
+                                                    slint::invoke_from_event_loop(move || {
+                                                        if let Some(ui) = ui_weak_clone.upgrade() {
+                                                            ui.set_loading_slot(-1);
+                                                        }
+                                                    }).ok();
+                                                    return;
+                                                }
+
+                                                // Success! Both ACKs received
+                                                let elapsed = start_time.elapsed();
+                                                println!("✓ Saved sample (header+data) for slot {} in {:.3}s", slot, elapsed.as_secs_f64());
+
+                                                // Clear name_edited flag and loading state on main thread
+                                                let ui_weak_clone = ui_weak.clone();
+                                                slint::invoke_from_event_loop(move || {
+                                                    if let Some(ui) = ui_weak_clone.upgrade() {
+                                                        ui.invoke_clear_name_edited_flag(slot);
+                                                        ui.set_loading_slot(-1);
+                                                    }
+                                                }).ok();
+                                            }
+                                            Err(e) => {
+                                                println!("✗ Failed to receive ACK after data: {}", e);
+                                                let ui_weak_clone = ui_weak.clone();
+                                                slint::invoke_from_event_loop(move || {
+                                                    if let Some(ui) = ui_weak_clone.upgrade() {
+                                                        ui.set_loading_slot(-1);
+                                                    }
+                                                }).ok();
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("✗ Failed to send data: {}", e);
+                                        let ui_weak_clone = ui_weak.clone();
+                                        slint::invoke_from_event_loop(move || {
+                                            if let Some(ui) = ui_weak_clone.upgrade() {
+                                                ui.set_loading_slot(-1);
+                                            }
+                                        }).ok();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("✗ Failed to receive ACK after header: {}", e);
+                                let ui_weak_clone = ui_weak.clone();
+                                slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = ui_weak_clone.upgrade() {
+                                        ui.set_loading_slot(-1);
+                                    }
+                                }).ok();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("✗ Failed to send header: {}", e);
+                        let ui_weak_clone = ui_weak.clone();
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak_clone.upgrade() {
+                                ui.set_loading_slot(-1);
+                            }
+                        }).ok();
+                    }
+                }
+            } else {
+                println!("ERROR: Device not connected");
+                let ui_weak_clone = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak_clone.upgrade() {
+                        ui.set_loading_slot(-1);
+                    }
+                }).ok();
+            }
+        });
     });
 }

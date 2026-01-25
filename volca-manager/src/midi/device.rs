@@ -3,7 +3,7 @@ use coremidi::{Client, Destination, Destinations, InputPort, OutputPort, PacketB
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use volsa2_core::proto::{self, Header, Incoming, Outgoing, SearchDeviceRequest, SearchDeviceReply, SampleHeader, SampleHeaderDumpRequest, SampleData, SampleDataDumpRequest};
+use volsa2_core::proto::{self, Header, Incoming, Outgoing, SearchDeviceRequest, SearchDeviceReply, SampleHeader, SampleHeaderDumpRequest, SampleData, SampleDataDumpRequest, Status};
 use volsa2_core::seven_bit::U7;
 
 const DEVICE_NAME: &str = "volca sample";
@@ -187,6 +187,11 @@ impl MidiDevice {
 
     /// Fetch sample header information from a specific slot
     pub fn get_sample_info(&mut self, slot: u8) -> Result<SampleHeader> {
+        // Clear buffer to avoid reading stale data from previous operations
+        if let Ok(mut buffer) = self.input_buffer.lock() {
+            buffer.clear();
+        }
+
         let request = SampleHeaderDumpRequest { sample_no: slot };
         self.send_message(&request)?;
         self.receive_message::<SampleHeader>(Duration::from_secs(5))
