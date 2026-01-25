@@ -247,9 +247,12 @@ impl Incoming for SampleData {
         let (sample_no, data) = read_u8(slice);
         let mut buf = Vec::with_capacity(U7ToU8::convert_len(data.len()) / 2 + 1);
         let mut current_num = [0, 0];
+        let mut last_idx = 0;
+
         FromKorgData::new(data.iter().copied().map(U7::new)) // TODO: Pod cast
             .enumerate()
             .for_each(|(idx, byte)| {
+                last_idx = idx;
                 if idx % 2 == 0 {
                     current_num = [byte, 0];
                 } else {
@@ -257,6 +260,15 @@ impl Incoming for SampleData {
                     buf.push(i16::from_le_bytes(current_num));
                 }
             });
+
+        // Handle odd byte count - push the last partial sample if exists
+        if last_idx % 2 == 0 && last_idx > 0 {
+            println!("DEBUG: SampleData parse - odd byte count, last byte = {}, pushing partial sample", current_num[0]);
+            buf.push(i16::from_le_bytes(current_num));
+        }
+
+        println!("DEBUG: SampleData parse - decoded {} samples from {} 7-bit bytes", buf.len(), data.len());
+
         Ok(SampleData {
             sample_no,
             data: buf,

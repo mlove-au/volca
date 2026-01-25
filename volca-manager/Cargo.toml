@@ -11,7 +11,7 @@ volsa2-core = { path = "../volsa2-core" }
 
 # GUI and platform
 slint = "1.9"              # GUI framework
-midir = "0.9"              # MIDI communication
+coremidi = "0.8"           # CoreMIDI for macOS MIDI communication
 rodio = "0.17"             # Audio playback
 rfd = "0.15"               # Native file dialogs
 
