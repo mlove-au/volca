@@ -4,6 +4,7 @@ export struct SampleInfo {
     slot: int,
     name: string,
     length: int,
+    speed: int,
     has-sample: bool,
 }
 
@@ -245,14 +246,14 @@ component SamplePad inherits Rectangle {
     }
 
     VerticalLayout {
-        padding: 10px;
-        spacing: 4px;
+        padding: 8px;
+        spacing: 3px;
         alignment: stretch;
 
         // Slot number
         Text {
             text: sample.slot < 10 ? "00" + sample.slot : (sample.slot < 100 ? "0" + sample.slot : "" + sample.slot);
-            font-size: 14px;
+            font-size: 13px;
             font-weight: 700;
             color: #666;
             horizontal-alignment: center;
@@ -261,7 +262,7 @@ component SamplePad inherits Rectangle {
         // Sample name or empty indicator
         Text {
             text: sample.has-sample ? sample.name : "(empty)";
-            font-size: 12px;
+            font-size: 11px;
             font-weight: sample.has-sample ? 600 : 400;
             color: sample.has-sample ? #333 : #999;
             overflow: elide;
@@ -271,8 +272,18 @@ component SamplePad inherits Rectangle {
         // Length display (rounded to 1 decimal place)
         if sample.has-sample: Text {
             text: round(sample.length / 3125.0) / 10.0 + "s";
-            font-size: 11px;
+            font-size: 10px;
             color: #666;
+            horizontal-alignment: center;
+        }
+
+        // Sample rate display in kHz
+        if sample.has-sample: Text {
+            text: Math.mod(round(31.25 * sample.speed / 16384.0 * 100), 100) == 0
+                    ? round(31.25 * sample.speed / 16384.0) + " kHz"
+                    : round(31.25 * sample.speed / 16384.0 * 100) / 100 + " kHz";
+            font-size: 9px;
+            color: #888;
             horizontal-alignment: center;
         }
 
@@ -439,7 +450,7 @@ export component AppWindow inherits Window {
                     for i in [0, 1, 2, 3, 4]: SamplePad {
                         sample: samples[start-slot + i];
                         width: 130px;
-                        height: 100px;
+                        height: 120px;
                         selected: selected-slot == samples[start-slot + i].slot;
                         upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                         download-clicked => { download-clicked(samples[start-slot + i].slot); }
@@ -455,7 +466,7 @@ export component AppWindow inherits Window {
                     for i in [5, 6, 7, 8, 9]: SamplePad {
                         sample: samples[start-slot + i];
                         width: 130px;
-                        height: 100px;
+                        height: 120px;
                         selected: selected-slot == samples[start-slot + i].slot;
                         upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                         download-clicked => { download-clicked(samples[start-slot + i].slot); }

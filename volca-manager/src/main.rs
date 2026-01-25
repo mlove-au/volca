@@ -153,6 +153,7 @@ impl AppState {
                 slot: i,
                 name: SharedString::from(""),
                 length: 0,
+                speed: 0,
                 has_sample: false,
             });
         }
@@ -200,6 +201,7 @@ impl AppState {
                             slot: slot as i32,
                             name: SharedString::from(if has_sample { header.name.as_str() } else { "(empty)" }),
                             length: header.length as i32,
+                            speed: header.speed as i32,
                             has_sample,
                         });
 
@@ -215,6 +217,7 @@ impl AppState {
                             slot: slot as i32,
                             name: SharedString::from("(error)"),
                             length: 0,
+                            speed: 0,
                             has_sample: false,
                         });
                     }
@@ -576,8 +579,24 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                             (sample_data.data.len() * 2) as f64 / 1024.0));
 
                         // Store in memory with speed metadata for correct playback
-                        state_download.downloaded_samples.borrow_mut().insert(slot as u8, (sample_data.data, header.speed));
+                        state_download.downloaded_samples.borrow_mut().insert(slot as u8, (sample_data.data.clone(), header.speed));
                         state_download.log(format!("✓ Sample stored in memory (slot {}, speed {})", slot, header.speed));
+
+                        // Display the downloaded sample in the waveform viewer
+                        let ui = state_download.ui.upgrade().unwrap();
+                        ui.set_selected_slot(slot);
+                        ui.set_selected_sample_name(SharedString::from(header.name.clone()));
+                        ui.set_selected_sample_length(header.length as i32);
+
+                        // Generate waveform path for visualization
+                        let width = ui.get_waveform_display_width();
+                        let height = ui.get_waveform_display_height();
+                        let waveform_path = generate_waveform_path(&sample_data.data, 1000, width as f64, height as f64);
+                        ui.set_waveform_path(SharedString::from(waveform_path));
+
+                        // Reset zoom and scroll for new sample
+                        ui.set_waveform_zoom(1.0);
+                        ui.set_waveform_scroll(0.0);
 
                         state_download.log(format!(""));
                         state_download.log(format!("=== Download Complete ==="));
@@ -618,10 +637,11 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
 
         if let Some(sample) = state_play.get_sample(slot) {
             if sample.has_sample {
-                // Check if we have the sample data in memory
-                if let Some((audio_data, speed)) = state_play.downloaded_samples.borrow().get(&(slot as u8)) {
+                // Check if we have the sample data in memory - clone immediately to avoid holding borrow
+                let maybe_audio_data = state_play.downloaded_samples.borrow().get(&(slot as u8)).map(|(data, speed)| (data.clone(), *speed));
+                if let Some((audio_data, speed)) = maybe_audio_data {
                     let sample_count = audio_data.len();
-                    let effective_rate = (31250.0 * (*speed as f64 / 16384.0)) as u32;
+                    let effective_rate = (31250.0 * (speed as f64 / 16384.0)) as u32;
                     let duration_secs = sample_count as f64 / effective_rate as f64;
                     state_play.log(format!("Playing {} ({:.1}s)", sample.name, duration_secs));
 
@@ -636,12 +656,10 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                     ui.set_playback_position(0.0);
 
                     // Play the audio in a background thread
-                    let audio_clone = audio_data.clone();
-                    let speed_clone = *speed;
                     let is_playing_flag = state_play.is_playing.clone();
                     let playback_info_flag = state_play.playback_info.clone();
                     std::thread::spawn(move || {
-                        let completed = play_audio_sample(&audio_clone, speed_clone, rx);
+                        let completed = play_audio_sample(&audio_data, speed, rx);
                         println!("Playback {}", if completed { "complete" } else { "stopped" });
                         is_playing_flag.store(false, Ordering::SeqCst);
                         *playback_info_flag.lock().unwrap() = None;
@@ -712,35 +730,77 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
 
         // Get sample info for the selected slot
         if let Some(sample) = state_select.get_sample(slot) {
-            if sample.has_sample {
-                ui.set_selected_sample_name(sample.name.clone());
-                ui.set_selected_sample_length(sample.length as i32);
+            // Do nothing if the slot is empty
+            if !sample.has_sample {
+                return;
+            }
 
-                // Check if we have downloaded audio data for this slot
-                if let Some((audio_data, _speed)) = state_select.downloaded_samples.borrow().get(&(slot as u8)) {
+            ui.set_selected_sample_name(sample.name.clone());
+            ui.set_selected_sample_length(sample.length as i32);
+
+            // Check if we have downloaded audio data for this slot
+            // Clone the data immediately to avoid holding the borrow
+            let maybe_audio_data = state_select.downloaded_samples.borrow().get(&(slot as u8)).map(|(data, speed)| (data.clone(), *speed));
+                if let Some((audio_data, _speed)) = maybe_audio_data {
                     state_select.log(format!("Selected slot {}: {} ({} samples)", slot, sample.name, audio_data.len()));
 
                     // Generate SVG path for waveform using current display dimensions
                     let width = ui.get_waveform_display_width();
                     let height = ui.get_waveform_display_height();
-                    let waveform_path = generate_waveform_path(audio_data, 1000, width as f64, height as f64);
+                    let waveform_path = generate_waveform_path(&audio_data, 1000, width as f64, height as f64);
                     ui.set_waveform_path(SharedString::from(waveform_path));
                 } else {
-                    state_select.log(format!("Selected slot {}: {} (not downloaded)", slot, sample.name));
-                    // Clear waveform path
+                    // Sample not downloaded yet - download it automatically
+                    state_select.log(format!("Selected slot {}: {} (downloading...)", slot, sample.name));
                     ui.set_waveform_path(SharedString::from(""));
-                }
-            } else {
-                ui.set_selected_sample_name(slint::SharedString::from("Empty slot"));
-                ui.set_selected_sample_length(0);
-                // Clear waveform path
-                ui.set_waveform_path(SharedString::from(""));
-            }
-        }
 
-        // Reset zoom and scroll when selecting a new sample
-        ui.set_waveform_zoom(1.0);
-        ui.set_waveform_scroll(0.0);
+                    // Get device and download the sample
+                    let mut device_guard = state_select.device.borrow_mut();
+                    if let Some(device) = device_guard.as_mut() {
+                        use std::time::Instant;
+                        let start_time = Instant::now();
+
+                        // Fetch sample header and data
+                        match device.get_sample_info(slot as u8) {
+                            Ok(header) => {
+                                match device.get_sample_data(slot as u8, header.length as usize) {
+                                    Ok(sample_data) => {
+                                        let elapsed = start_time.elapsed();
+
+                                        // Store in memory (clone data first to avoid holding borrow during UI updates)
+                                        let audio_data_clone = sample_data.data.clone();
+                                        state_select.downloaded_samples.borrow_mut().insert(
+                                            slot as u8,
+                                            (audio_data_clone.clone(), header.speed)
+                                        );
+
+                                        // Log success AFTER the insert to avoid holding borrow during UI update
+                                        state_select.log(format!("✓ Downloaded in {:.3}s", elapsed.as_secs_f64()));
+
+                                        // Generate and display waveform
+                                        let width = ui.get_waveform_display_width();
+                                        let height = ui.get_waveform_display_height();
+                                        let waveform_path = generate_waveform_path(&audio_data_clone, 1000, width as f64, height as f64);
+                                        ui.set_waveform_path(SharedString::from(waveform_path));
+                                    }
+                                    Err(e) => {
+                                        state_select.log(format!("✗ Download failed: {}", e));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                state_select.log(format!("✗ Failed to get sample info: {}", e));
+                            }
+                        }
+                    } else {
+                        state_select.log("ERROR: Device not connected".to_string());
+                    }
+                }
+
+            // Reset zoom and scroll when selecting a new sample
+            ui.set_waveform_zoom(1.0);
+            ui.set_waveform_scroll(0.0);
+        }
     });
 
     // Regenerate waveform when display size changes
@@ -752,9 +812,11 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         // Only regenerate if we have a sample selected
         if let Some(sample) = state_regen.get_sample(slot) {
             if sample.has_sample {
-                if let Some((audio_data, _speed)) = state_regen.downloaded_samples.borrow().get(&(slot as u8)) {
+                // Clone the data immediately to avoid holding the borrow
+                let maybe_audio_data = state_regen.downloaded_samples.borrow().get(&(slot as u8)).map(|(data, speed)| (data.clone(), *speed));
+                if let Some((audio_data, _speed)) = maybe_audio_data {
                     // Regenerate waveform with new dimensions
-                    let waveform_path = generate_waveform_path(audio_data, 1000, width as f64, height as f64);
+                    let waveform_path = generate_waveform_path(&audio_data, 1000, width as f64, height as f64);
                     ui.set_waveform_path(SharedString::from(waveform_path));
                     println!("Regenerated waveform: {}x{}", width, height);
                 }
