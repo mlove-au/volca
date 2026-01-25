@@ -13,8 +13,16 @@ component WaveformView inherits Rectangle {
     in property <int> sample-length: 0;
     in property <string> waveform-path: "";  // SVG path commands for waveform
     in property <bool> has-waveform: false;
+    in property <bool> is-playing: false;
+    in property <float> playback-position: 0.0;  // 0.0 to 1.0
     in-out property <float> zoom-level: 1.0;
     in-out property <float> scroll-position: 0.0;
+
+    // Track display dimensions for waveform regeneration
+    in-out property <length> waveform-display-width;
+    in-out property <length> waveform-display-height;
+
+    callback regenerate-waveform(/* width */ float, /* height */ float);
 
     callback zoom-in();
     callback zoom-out();
@@ -70,11 +78,23 @@ component WaveformView inherits Rectangle {
         }
 
         // Waveform display area
-        Rectangle {
+        waveform-display-area := Rectangle {
             vertical-stretch: 1;
             background: #0d0d1a;
             border-radius: 2px;
             clip: true;
+
+            // Track display dimensions and trigger regeneration when they change
+            changed width => {
+                root.waveform-display-width = self.width;
+                root.waveform-display-height = self.height;
+                root.regenerate-waveform(self.width / 1px, self.height / 1px);
+            }
+            changed height => {
+                root.waveform-display-width = self.width;
+                root.waveform-display-height = self.height;
+                root.regenerate-waveform(self.width / 1px, self.height / 1px);
+            }
 
             // Grid lines
             // Horizontal center line (zero crossing)
@@ -123,6 +143,7 @@ component WaveformView inherits Rectangle {
             }
 
             // Waveform path rendered from SVG commands (filled envelope)
+            // Viewbox matches parent dimensions for proper scaling
             if has-waveform: Path {
                 x: 0;
                 y: 0;
@@ -132,10 +153,19 @@ component WaveformView inherits Rectangle {
                 fill: #4a90e2;
                 stroke: #6ab0ff;
                 stroke-width: 0.5px;
-                viewbox-x: scroll-position * 1000;
+                viewbox-x: scroll-position * (parent.width / 1px);
                 viewbox-y: 0;
-                viewbox-width: 1000 / zoom-level;
-                viewbox-height: 200;
+                viewbox-width: (parent.width / 1px) / zoom-level;
+                viewbox-height: parent.height / 1px;
+            }
+
+            // Playhead indicator (only visible during playback with waveform)
+            if is-playing && has-waveform: Rectangle {
+                x: (playback-position - scroll-position) * zoom-level * parent.width;
+                y: 0;
+                width: 2px;
+                height: parent.height;
+                background: #ff6b6b;
             }
 
             // Y-axis labels
@@ -294,6 +324,7 @@ export component AppWindow inherits Window {
     callback waveform-zoom-in();
     callback waveform-zoom-out();
     callback waveform-zoom-reset();
+    callback regenerate-waveform(float, float);
     callback play-clicked();
     callback stop-clicked();
 
@@ -314,6 +345,9 @@ export component AppWindow inherits Window {
     in-out property <float> waveform-zoom: 1.0;
     in-out property <float> waveform-scroll: 0.0;
     in-out property <bool> is-playing: false;
+    in-out property <length> waveform-display-width;
+    in-out property <length> waveform-display-height;
+    in-out property <float> playback-position: 0.0;  // 0.0 to 1.0
 
     // Calculate which samples to display (10 per page - 5x2 grid)
     property <int> start-slot: current-page * 10;
@@ -439,11 +473,16 @@ export component AppWindow inherits Window {
                 sample-length: selected-sample-length;
                 waveform-path: waveform-path;
                 has-waveform: selected-slot >= 0;
+                is-playing: is-playing;
+                playback-position: playback-position;
                 zoom-level <=> waveform-zoom;
                 scroll-position <=> waveform-scroll;
+                waveform-display-width <=> root.waveform-display-width;
+                waveform-display-height <=> root.waveform-display-height;
                 zoom-in => { waveform-zoom-in(); }
                 zoom-out => { waveform-zoom-out(); }
                 zoom-reset => { waveform-zoom-reset(); }
+                regenerate-waveform(width, height) => { root.regenerate-waveform(width, height); }
             }
 
             // Playback controls

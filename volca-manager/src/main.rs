@@ -10,13 +10,17 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
 
 /// Generate SVG path commands for waveform display (envelope style)
-/// Uses viewbox coordinates: x in [0, 1000], y in [0, 200] where y=100 is center
+/// Coordinates normalized to viewbox dimensions: x in [0, width], y in [0, height]
+/// Sample value +1 maps to y=0 (top), -1 maps to y=height (bottom), 0 at center
 /// Creates a filled envelope showing min/max values at each point
-fn generate_waveform_path(samples: &[i16], num_points: usize) -> String {
+fn generate_waveform_path(samples: &[i16], num_points: usize, width: f64, height: f64) -> String {
     if samples.is_empty() {
-        return String::from("M 0 100 L 1000 100 L 1000 100 L 0 100 Z");
+        let center_y = height / 2.0;
+        return format!("M 0 {} L {} {} L {} {} L 0 {} Z", center_y, width, center_y, width, center_y, center_y);
     }
 
     let num_points = num_points.max(2);  // Need at least 2 points
@@ -45,11 +49,13 @@ fn generate_waveform_path(samples: &[i16], num_points: usize) -> String {
         }
 
         // Convert to viewbox coordinates
-        // x: 0 to 1000 (full width, guaranteed)
-        // y: 0 (top, +1.0) to 200 (bottom, -1.0), center at 100
-        let x = t * 1000.0;
-        let y_max = 100.0 - (max_val as f64 / i16::MAX as f64) * 98.0;
-        let y_min = 100.0 - (min_val as f64 / i16::MAX as f64) * 98.0;
+        // x: 0 to width (full width)
+        // y: 0 (top, +1.0) to height (bottom, -1.0), center at height/2
+        let x = t * width;
+        let center_y = height / 2.0;
+        let y_range = height * 0.98 / 2.0;  // Use 98% of height for waveform (slight padding)
+        let y_max = center_y - (max_val as f64 / i16::MAX as f64) * y_range;
+        let y_min = center_y - (min_val as f64 / i16::MAX as f64) * y_range;
 
         upper_points.push((x, y_max));
         lower_points.push((x, y_min));
@@ -59,28 +65,28 @@ fn generate_waveform_path(samples: &[i16], num_points: usize) -> String {
     let mut path = String::with_capacity(num_points * 40);
 
     // Start at x=0 with first point
-    path.push_str(&format!("M 0 {:.1}", upper_points.first().map(|p| p.1).unwrap_or(100.0)));
+    path.push_str(&format!("M 0 {:.1}", upper_points.first().map(|p| p.1).unwrap_or(500.0)));
 
     // Draw upper envelope
     for &(x, y) in upper_points.iter() {
         path.push_str(&format!(" L {:.1} {:.1}", x, y));
     }
 
-    // Ensure we reach x=1000
+    // Ensure we reach x=width
     if let Some(&(_, y)) = upper_points.last() {
-        path.push_str(&format!(" L 1000 {:.1}", y));
+        path.push_str(&format!(" L {:.1} {:.1}", width, y));
     }
 
     // Draw lower envelope in reverse
     if let Some(&(_, y)) = lower_points.last() {
-        path.push_str(&format!(" L 1000 {:.1}", y));
+        path.push_str(&format!(" L {:.1} {:.1}", width, y));
     }
     for &(x, y) in lower_points.iter().rev() {
         path.push_str(&format!(" L {:.1} {:.1}", x, y));
     }
 
     // Close back to start
-    path.push_str(&format!(" L 0 {:.1}", lower_points.first().map(|p| p.1).unwrap_or(100.0)));
+    path.push_str(&format!(" L 0 {:.1}", lower_points.first().map(|p| p.1).unwrap_or(500.0)));
     path.push_str(" Z");
 
     path
@@ -96,6 +102,7 @@ pub struct AppState {
     pub downloaded_samples: Rc<RefCell<HashMap<u8, (Vec<i16>, u16)>>>,  // (audio_data, speed)
     pub stop_sender: Rc<RefCell<Option<Sender<()>>>>,  // Channel to signal stop playback
     pub is_playing: Arc<AtomicBool>,  // Thread-safe playback state
+    pub playback_info: Arc<Mutex<Option<(Instant, f64)>>>,  // (start_time, duration_secs)
 }
 
 impl AppState {
@@ -160,6 +167,7 @@ impl AppState {
             downloaded_samples: Rc::new(RefCell::new(HashMap::new())),
             stop_sender: Rc::new(RefCell::new(None)),
             is_playing: Arc::new(AtomicBool::new(false)),
+            playback_info: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -250,6 +258,7 @@ impl Clone for AppState {
             downloaded_samples: self.downloaded_samples.clone(),
             stop_sender: self.stop_sender.clone(),
             is_playing: self.is_playing.clone(),
+            playback_info: self.playback_info.clone(),
         }
     }
 }
@@ -367,18 +376,47 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     }
 
-    // Timer to sync playback state from thread to UI
+    // Timer to sync playback state and position from thread to UI
     let is_playing_timer = app_state.is_playing.clone();
+    let playback_info_timer = app_state.playback_info.clone();
     let ui_weak_timer = ui.as_weak();
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(50),  // 50ms for smoother playhead movement
         move || {
             if let Some(ui) = ui_weak_timer.upgrade() {
                 let playing = is_playing_timer.load(Ordering::SeqCst);
                 if ui.get_is_playing() != playing {
                     ui.set_is_playing(playing);
+                    if !playing {
+                        // Reset position when playback stops
+                        ui.set_playback_position(0.0);
+                    }
+                }
+
+                // Update playback position if playing
+                if playing {
+                    if let Some((start_time, duration)) = *playback_info_timer.lock().unwrap() {
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        let position = (elapsed / duration).min(1.0);
+                        ui.set_playback_position(position as f32);
+
+                        // Auto-scroll when zoomed: keep playhead at 75% of visible area
+                        let zoom = ui.get_waveform_zoom();
+                        if zoom > 1.0 {
+                            let visible_range = 1.0 / zoom;
+                            let current_scroll = ui.get_waveform_scroll();
+                            let playhead_in_view = (position - current_scroll as f64) / visible_range as f64;
+
+                            // Scroll when playhead reaches 75% of visible area
+                            if playhead_in_view > 0.75 {
+                                let new_scroll = (position - 0.75 * visible_range as f64) as f32;
+                                let max_scroll = 1.0 - 1.0 / zoom;
+                                ui.set_waveform_scroll(new_scroll.min(max_scroll).max(0.0));
+                            }
+                        }
+                    }
                 }
             }
         },
@@ -584,24 +622,29 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                 if let Some((audio_data, speed)) = state_play.downloaded_samples.borrow().get(&(slot as u8)) {
                     let sample_count = audio_data.len();
                     let effective_rate = (31250.0 * (*speed as f64 / 16384.0)) as u32;
-                    state_play.log(format!("Playing {} ({} samples at {} Hz)", sample.name, sample_count, effective_rate));
+                    let duration_secs = sample_count as f64 / effective_rate as f64;
+                    state_play.log(format!("Playing {} ({:.1}s)", sample.name, duration_secs));
 
                     // Create stop channel
                     let (tx, rx) = mpsc::channel();
                     *state_play.stop_sender.borrow_mut() = Some(tx);
 
-                    // Set playing state
+                    // Set playing state and store playback info for position tracking
                     state_play.is_playing.store(true, Ordering::SeqCst);
+                    *state_play.playback_info.lock().unwrap() = Some((Instant::now(), duration_secs));
                     ui.set_is_playing(true);
+                    ui.set_playback_position(0.0);
 
                     // Play the audio in a background thread
                     let audio_clone = audio_data.clone();
                     let speed_clone = *speed;
                     let is_playing_flag = state_play.is_playing.clone();
+                    let playback_info_flag = state_play.playback_info.clone();
                     std::thread::spawn(move || {
                         let completed = play_audio_sample(&audio_clone, speed_clone, rx);
                         println!("Playback {}", if completed { "complete" } else { "stopped" });
                         is_playing_flag.store(false, Ordering::SeqCst);
+                        *playback_info_flag.lock().unwrap() = None;
                     });
                 } else {
                     state_play.log(format!("Sample not downloaded yet. Click 💾 to download first."));
@@ -677,8 +720,10 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                 if let Some((audio_data, _speed)) = state_select.downloaded_samples.borrow().get(&(slot as u8)) {
                     state_select.log(format!("Selected slot {}: {} ({} samples)", slot, sample.name, audio_data.len()));
 
-                    // Generate SVG path for waveform (1000 points for smooth display)
-                    let waveform_path = generate_waveform_path(audio_data, 1000);
+                    // Generate SVG path for waveform using current display dimensions
+                    let width = ui.get_waveform_display_width();
+                    let height = ui.get_waveform_display_height();
+                    let waveform_path = generate_waveform_path(audio_data, 1000, width as f64, height as f64);
                     ui.set_waveform_path(SharedString::from(waveform_path));
                 } else {
                     state_select.log(format!("Selected slot {}: {} (not downloaded)", slot, sample.name));
@@ -696,6 +741,25 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         // Reset zoom and scroll when selecting a new sample
         ui.set_waveform_zoom(1.0);
         ui.set_waveform_scroll(0.0);
+    });
+
+    // Regenerate waveform when display size changes
+    let state_regen = state.clone();
+    ui.on_regenerate_waveform(move |width, height| {
+        let ui = state_regen.ui.upgrade().unwrap();
+        let slot = ui.get_selected_slot();
+
+        // Only regenerate if we have a sample selected
+        if let Some(sample) = state_regen.get_sample(slot) {
+            if sample.has_sample {
+                if let Some((audio_data, _speed)) = state_regen.downloaded_samples.borrow().get(&(slot as u8)) {
+                    // Regenerate waveform with new dimensions
+                    let waveform_path = generate_waveform_path(audio_data, 1000, width as f64, height as f64);
+                    ui.set_waveform_path(SharedString::from(waveform_path));
+                    println!("Regenerated waveform: {}x{}", width, height);
+                }
+            }
+        }
     });
 
     // Waveform zoom callbacks
