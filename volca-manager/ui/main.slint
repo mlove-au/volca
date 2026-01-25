@@ -9,6 +9,31 @@ export struct SampleInfo {
     name-edited: bool,
 }
 
+// Custom button with proper text centering
+component CustomButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    border-radius: 4px;
+    background: touch-area.pressed ? #0056b3 : (touch-area.has-hover ? #007bff : #0069d9);
+    border-width: 1px;
+    border-color: #0056b3;
+
+    touch-area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.text;
+        color: root.enabled ? #ffffff : #888888;
+        font-size: 14px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
 // Waveform viewer component
 component WaveformView inherits Rectangle {
     in property <string> sample-name: "No sample selected";
@@ -36,7 +61,7 @@ component WaveformView inherits Rectangle {
         padding: 8px;
         spacing: 4px;
 
-        // Header with sample info and zoom controls
+        // Header with sample info and controls
         HorizontalLayout {
             height: 24px;
             spacing: 8px;
@@ -53,6 +78,7 @@ component WaveformView inherits Rectangle {
 
             if has-waveform: Button {
                 text: "Load WAV...";
+                min-height: 32px;
                 clicked => { load-wav-clicked(); }
             }
         }
@@ -337,11 +363,13 @@ component SamplePad inherits Rectangle {
 
         // Action buttons - anchored at bottom
         HorizontalLayout {
-            spacing: 4px;
+            spacing: 6px;
             alignment: center;
 
             if sample.has-sample: Button {
                 text: "💾";
+                min-width: 40px;
+                min-height: 40px;
                 clicked => {
                     root.is-editing = false;
                     save-clicked();
@@ -350,16 +378,22 @@ component SamplePad inherits Rectangle {
 
             if sample.has-sample: Button {
                 text: "🔄";
+                min-width: 40px;
+                min-height: 40px;
                 clicked => { download-clicked(); }
             }
 
             if !sample.has-sample: Button {
                 text: "⬆";
+                min-width: 40px;
+                min-height: 40px;
                 clicked => { upload-clicked(); }
             }
 
             if sample.has-sample: Button {
                 text: "🗑";
+                min-width: 40px;
+                min-height: 40px;
                 clicked => { delete-clicked(); }
             }
         }
@@ -368,10 +402,10 @@ component SamplePad inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Volca Sample 2 Manager";
-    preferred-width: 800px;
-    preferred-height: show-debug-log ? 680px : 540px;
-    min-width: 800px;
-    min-height: show-debug-log ? 680px : 540px;
+    preferred-width: 860px;
+    preferred-height: 700px;
+    min-width: 860px;
+    min-height: 700px;
     default-font-family: "SF Mono";
 
     callback connect-clicked();
@@ -445,177 +479,219 @@ export component AppWindow inherits Window {
 
         VerticalLayout {
             padding: 12px;
-            spacing: 8px;
+            spacing: 12px;
 
-            // Connection bar
-            HorizontalBox {
-                height: 32px;
-                spacing: 12px;
+            // ========== SECTION 1: HEADER (LED, Status, Buttons) ==========
+            Rectangle {
+                border-width: 1px;
+                border-color: #cccccc;
+                border-radius: 4px;
 
-                Rectangle {
-                    width: 10px;
-                    height: 10px;
-                    border-radius: 5px;
-                    background: connected ? #4caf50 : #f44336;
-                }
-
-                Text {
-                    text: connected ? (scanning ? "Connected - Scanning..." : "Connected to Volca Sample 2") : "Not Connected";
-                    font-size: 14px;
-                    font-weight: 600;
-                    vertical-alignment: center;
-                }
-
-                Rectangle {
-                    horizontal-stretch: 1;
-                }
-
-                Button {
-                    text: connected ? "Disconnect" : "Connect";
-                    clicked => { connect-clicked(); }
-                }
-
-                Button {
-                    text: "Scan";
-                    clicked => { refresh-clicked(); }
-                    enabled: connected && !scanning;
-                }
-            }
-
-            // Page navigation
-            HorizontalBox {
-                height: 28px;
-                spacing: 8px;
-                alignment: center;
-
-                Button {
-                    text: "◀";
-                    clicked => { prev-page-clicked(); }
-                    enabled: current-page > 0;
-                }
-
-                Text {
-                    text: "Page " + (current-page + 1) + "/" + total-pages + " (Slots " + start-slot + "-" + (start-slot + 9) + ")";
-                    font-size: 12px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                }
-
-                Button {
-                    text: "▶";
-                    clicked => { next-page-clicked(); }
-                    enabled: current-page < (total-pages - 1);
-                }
-            }
-
-            // 5x2 Sample Grid
-            VerticalBox {
-                spacing: 6px;
-
-                // Row 1: Slots 0-4 (relative to page)
                 HorizontalLayout {
-                    spacing: 6px;
-                    alignment: center;
-                    for i in [0, 1, 2, 3, 4]: SamplePad {
-                        sample: samples[start-slot + i];
-                        width: 130px;
-                        height: 120px;
-                        selected: selected-slot == samples[start-slot + i].slot;
-                        is-loading: loading-slot == samples[start-slot + i].slot;
-                        current-page: current-page;
-                        upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
-                        download-clicked => { download-clicked(samples[start-slot + i].slot); }
-                        delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
-                        pad-clicked => { pad-selected(samples[start-slot + i].slot); }
-                        name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
-                        save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
+                    padding: 10px;
+                    spacing: 16px;
+
+                    Rectangle {
+                        width: 10px;
+                        height: 10px;
+                        border-radius: 5px;
+                        background: connected ? #4caf50 : #f44336;
                     }
-                }
 
-                // Row 2: Slots 5-9 (relative to page)
-                HorizontalLayout {
-                    spacing: 6px;
-                    alignment: center;
-                    for i in [5, 6, 7, 8, 9]: SamplePad {
-                        sample: samples[start-slot + i];
-                        width: 130px;
-                        height: 120px;
-                        selected: selected-slot == samples[start-slot + i].slot;
-                        is-loading: loading-slot == samples[start-slot + i].slot;
-                        current-page: current-page;
-                        upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
-                        download-clicked => { download-clicked(samples[start-slot + i].slot); }
-                        delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
-                        pad-clicked => { pad-selected(samples[start-slot + i].slot); }
-                        name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
-                        save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
+                    Text {
+                        text: connected ? (scanning ? "Connected - Scanning..." : "Connected to Volca Sample 2") : "Not Connected";
+                        font-size: 14px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+
+                    CustomButton {
+                        text: connected ? "Disconnect" : "Connect";
+                        width: 120px;
+                        height: 35px;
+                        clicked => { connect-clicked(); }
+                    }
+
+                    CustomButton {
+                        text: "Scan";
+                        width: 100px;
+                        height: 35px;
+                        clicked => { refresh-clicked(); }
+                        enabled: connected && !scanning;
                     }
                 }
             }
 
-            // Waveform viewer - expands to fill available space
-            WaveformView {
-                vertical-stretch: 1;
-                min-height: 150px;
-                sample-name: selected-sample-name;
-                sample-length: selected-sample-length;
-                waveform-path: waveform-path;
-                has-waveform: selected-slot >= 0;
-                is-playing: is-playing;
-                playback-position: playback-position;
-                zoom-level <=> waveform-zoom;
-                scroll-position <=> waveform-scroll;
-                waveform-display-width <=> root.waveform-display-width;
-                waveform-display-height <=> root.waveform-display-height;
-                regenerate-waveform(width, height) => { root.regenerate-waveform(width, height); }
-                load-wav-clicked => { load-wav-clicked(); }
-            }
+            // ========== SECTION 2: SAMPLE PADS (Navigation + Grid) ==========
+            Rectangle {
+                border-width: 1px;
+                border-color: #cccccc;
+                border-radius: 4px;
 
-            // Playback controls
-            HorizontalLayout {
-                height: 32px;
-                spacing: 8px;
-                alignment: center;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
 
-                Button {
-                    text: is-playing ? "⏹ Stop" : "▶ Play";
-                    enabled: selected-slot >= 0;
-                    clicked => {
-                        if is-playing {
-                            stop-clicked();
-                        } else {
-                            play-clicked();
+                    // Page navigation
+                    HorizontalLayout {
+                        height: 36px;
+                        spacing: 12px;
+
+                        Button {
+                            text: "◀";
+                            min-width: 40px;
+                            min-height: 36px;
+                            clicked => { prev-page-clicked(); }
+                            enabled: current-page > 0;
+                        }
+
+                        Text {
+                            text: "Page " + (current-page + 1) + "/" + total-pages + " (Slots " + start-slot + "-" + (start-slot + 9) + ")";
+                            font-size: 12px;
+                            font-weight: 600;
+                        }
+
+                        Button {
+                            text: "▶";
+                            min-width: 40px;
+                            min-height: 36px;
+                            clicked => { next-page-clicked(); }
+                            enabled: current-page < (total-pages - 1);
+                        }
+                    }
+
+                    // 5x2 Sample Grid
+                    VerticalLayout {
+                        spacing: 10px;
+
+                        // Row 1: Slots 0-4 (relative to page)
+                        HorizontalLayout {
+                            spacing: 10px;
+                            for i in [0, 1, 2, 3, 4]: SamplePad {
+                                sample: samples[start-slot + i];
+                                width: 140px;
+                                height: 130px;
+                                selected: selected-slot == samples[start-slot + i].slot;
+                                is-loading: loading-slot == samples[start-slot + i].slot;
+                                current-page: current-page;
+                                upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
+                                download-clicked => { download-clicked(samples[start-slot + i].slot); }
+                                delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
+                                pad-clicked => { pad-selected(samples[start-slot + i].slot); }
+                                name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
+                                save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
+                            }
+                        }
+
+                        // Row 2: Slots 5-9 (relative to page)
+                        HorizontalLayout {
+                            spacing: 10px;
+                            for i in [5, 6, 7, 8, 9]: SamplePad {
+                                sample: samples[start-slot + i];
+                                width: 140px;
+                                height: 130px;
+                                selected: selected-slot == samples[start-slot + i].slot;
+                                is-loading: loading-slot == samples[start-slot + i].slot;
+                                current-page: current-page;
+                                upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
+                                download-clicked => { download-clicked(samples[start-slot + i].slot); }
+                                delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
+                                pad-clicked => { pad-selected(samples[start-slot + i].slot); }
+                                name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
+                                save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
+                            }
                         }
                     }
                 }
             }
 
-            // Status bar
-            HorizontalBox {
-                height: 24px;
-                spacing: 8px;
+            // ========== SECTION 3: WAVEFORM VIEWER (Display + Controls) ==========
+            Rectangle {
+                vertical-stretch: 1;
+                border-width: 1px;
+                border-color: #cccccc;
+                border-radius: 4px;
 
-                Text {
-                    text: "Samples: ? / 200";
-                    font-size: 10px;
-                    color: #666;
-                    vertical-alignment: center;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+
+                    // Waveform viewer - expands to fill available space
+                    WaveformView {
+                        vertical-stretch: 1;
+                        min-height: 180px;
+                        sample-name: selected-sample-name;
+                        sample-length: selected-sample-length;
+                        waveform-path: waveform-path;
+                        has-waveform: selected-slot >= 0;
+                        is-playing: is-playing;
+                        playback-position: playback-position;
+                        zoom-level <=> waveform-zoom;
+                        scroll-position <=> waveform-scroll;
+                        waveform-display-width <=> root.waveform-display-width;
+                        waveform-display-height <=> root.waveform-display-height;
+                        regenerate-waveform(width, height) => { root.regenerate-waveform(width, height); }
+                        load-wav-clicked => { load-wav-clicked(); }
+                    }
+
+                    // Playback controls
+                    HorizontalLayout {
+                        height: 40px;
+                        spacing: 10px;
+
+                        Button {
+                            text: is-playing ? "⏹ Stop" : "▶ Play";
+                            min-width: 100px;
+                            min-height: 40px;
+                            enabled: selected-slot >= 0;
+                            clicked => {
+                                if is-playing {
+                                    stop-clicked();
+                                } else {
+                                    play-clicked();
+                                }
+                            }
+                        }
+                    }
                 }
+            }
 
-                Rectangle {
-                    horizontal-stretch: 1;
-                }
+            // ========== SECTION 4: STATUS BAR (Info + Debug Log Toggle) ==========
+            Rectangle {
+                border-width: 1px;
+                border-color: #cccccc;
+                border-radius: 4px;
 
-                Text {
-                    text: scanning ? "Scanning..." : "Ready";
-                    font-size: 10px;
-                    color: #999;
-                    vertical-alignment: center;
-                }
+                HorizontalLayout {
+                    padding: 10px;
+                    spacing: 12px;
 
-                Button {
-                    text: show-debug-log ? "Hide Log" : "Show Log";
-                    clicked => { toggle-debug-log(); }
+                    Text {
+                        text: "Samples: ? / 200";
+                        font-size: 10px;
+                        color: #666;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+
+                    Text {
+                        text: scanning ? "Scanning..." : "Ready";
+                        font-size: 10px;
+                        color: #999;
+                    }
+
+                    Button {
+                        text: show-debug-log ? "Hide Log" : "Show Log";
+                        min-width: 90px;
+                        min-height: 32px;
+                        clicked => { toggle-debug-log(); }
+                    }
                 }
             }
 
