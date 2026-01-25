@@ -15,7 +15,7 @@ pub struct AppState {
     pub firmware_version: String,
     pub logs: Rc<VecModel<SharedString>>,
     pub ui: slint::Weak<AppWindow>,
-    pub downloaded_samples: Rc<RefCell<HashMap<u8, Vec<i16>>>>,
+    pub downloaded_samples: Rc<RefCell<HashMap<u8, (Vec<i16>, u16)>>>,  // (audio_data, speed)
 }
 
 impl AppState {
@@ -170,25 +170,38 @@ impl Clone for AppState {
     }
 }
 
-/// Play audio samples using rodio
-fn play_audio_sample(samples: &[i16]) -> Result<(), Box<dyn std::error::Error>> {
+/// Play audio samples using rodio with speed-adjusted sample rate
+fn play_audio_sample(samples: &[i16], speed: u16) -> Result<(), Box<dyn std::error::Error>> {
     use rodio::{OutputStream, Sink};
     use rodio::buffer::SamplesBuffer;
+
+    println!("DEBUG: play_audio_sample called with {} samples, speed {}", samples.len(), speed);
 
     // Create output stream
     let (_stream, stream_handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&stream_handle)?;
 
-    // Volca Sample 2 specs: 31,250 Hz, mono, 16-bit
-    const SAMPLE_RATE: u32 = 31250;
+    // Volca Sample 2 base specs: 31,250 Hz, mono, 16-bit
+    // Speed is a fixed-point value where 16384 = 1.0x
+    const BASE_RATE: u32 = 31250;
+    const DEFAULT_SPEED: u16 = 16384;
     const CHANNELS: u16 = 1;
 
+    // Calculate effective sample rate based on speed metadata
+    let sample_rate = (BASE_RATE as f64 * (speed as f64 / DEFAULT_SPEED as f64)) as u32;
+
+    println!("DEBUG: Creating SamplesBuffer with {} samples at {} Hz (speed {})", samples.len(), sample_rate, speed);
+    let duration_secs = samples.len() as f64 / sample_rate as f64;
+    println!("DEBUG: Expected playback duration: {:.3}s", duration_secs);
+
     // Create audio buffer from i16 samples
-    let buffer = SamplesBuffer::new(CHANNELS, SAMPLE_RATE, samples.to_vec());
+    let buffer = SamplesBuffer::new(CHANNELS, sample_rate, samples.to_vec());
 
     // Add to sink and play
     sink.append(buffer);
+    println!("DEBUG: Starting playback...");
     sink.sleep_until_end();
+    println!("DEBUG: Playback complete");
 
     Ok(())
 }
@@ -392,9 +405,9 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                             sample_data.data.len(),
                             (sample_data.data.len() * 2) as f64 / 1024.0));
 
-                        // Store in memory
-                        state_download.downloaded_samples.borrow_mut().insert(slot as u8, sample_data.data);
-                        state_download.log(format!("✓ Sample stored in memory (slot {})", slot));
+                        // Store in memory with speed metadata for correct playback
+                        state_download.downloaded_samples.borrow_mut().insert(slot as u8, (sample_data.data, header.speed));
+                        state_download.log(format!("✓ Sample stored in memory (slot {}, speed {})", slot, header.speed));
 
                         state_download.log(format!(""));
                         state_download.log(format!("=== Download Complete ==="));
@@ -429,14 +442,17 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                 state_play.log(format!("Play slot {}: {}", slot, sample.name));
 
                 // Check if we have the sample data in memory
-                if let Some(audio_data) = state_play.downloaded_samples.borrow().get(&(slot as u8)) {
+                if let Some((audio_data, speed)) = state_play.downloaded_samples.borrow().get(&(slot as u8)) {
                     let sample_count = audio_data.len();
-                    state_play.log(format!("Playing {} samples at 31,250 Hz...", sample_count));
+                    // Calculate effective sample rate for display
+                    let effective_rate = (31250.0 * (*speed as f64 / 16384.0)) as u32;
+                    state_play.log(format!("Playing {} samples at {} Hz (speed {})...", sample_count, effective_rate, speed));
 
                     // Play the audio in a background thread
                     let audio_clone = audio_data.clone();
+                    let speed_clone = *speed;
                     std::thread::spawn(move || {
-                        match play_audio_sample(&audio_clone) {
+                        match play_audio_sample(&audio_clone, speed_clone) {
                             Ok(()) => {
                                 println!("✓ Playback complete");
                             }
