@@ -1,0 +1,231 @@
+import { Button, VerticalBox, HorizontalBox, ScrollView, GridBox, TextEdit } from "std-widgets.slint";
+
+export struct SampleInfo {
+    slot: int,
+    name: string,
+    length: int,
+    has-sample: bool,
+}
+
+component SampleSlot inherits Rectangle {
+    in property <SampleInfo> sample;
+    callback upload-clicked();
+    callback download-clicked();
+    callback play-clicked();
+    callback delete-clicked();
+
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: sample.has-sample ? #4a90e2 : #cccccc;
+    background: sample.has-sample ? #f0f8ff : #f9f9f9;
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 4px;
+
+        // Slot number
+        Text {
+            text: sample.slot < 10 ? "00" + sample.slot : (sample.slot < 100 ? "0" + sample.slot : "" + sample.slot);
+            font-size: 12px;
+            font-weight: 700;
+            color: #666;
+        }
+
+        // Sample name or empty indicator
+        Text {
+            text: sample.has-sample ? sample.name : "(empty)";
+            font-size: 14px;
+            font-weight: sample.has-sample ? 600 : 400;
+            color: sample.has-sample ? #333 : #999;
+            overflow: elide;
+            horizontal-alignment: center;
+        }
+
+        // Length display
+        if sample.has-sample: Text {
+            text: (sample.length / 31250) + "s";
+            font-size: 11px;
+            color: #666;
+            horizontal-alignment: center;
+        }
+
+        // Action buttons
+        HorizontalLayout {
+            spacing: 4px;
+
+            if sample.has-sample: Button {
+                text: "▶";
+                clicked => { play-clicked(); }
+                min-width: 30px;
+            }
+
+            if sample.has-sample: Button {
+                text: "💾";
+                clicked => { download-clicked(); }
+                min-width: 30px;
+            }
+
+            if !sample.has-sample: Button {
+                text: "⬆";
+                clicked => { upload-clicked(); }
+                min-width: 60px;
+            }
+
+            if sample.has-sample: Button {
+                text: "🗑";
+                clicked => { delete-clicked(); }
+                min-width: 30px;
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Volca Sample 2 Manager";
+    preferred-width: 1200px;
+    preferred-height: 800px;
+
+    callback connect-clicked();
+    callback refresh-clicked();
+    callback upload-clicked(int);
+    callback download-clicked(int);
+    callback play-clicked(int);
+    callback delete-clicked(int);
+
+    in-out property <bool> connected: false;
+    in-out property <[SampleInfo]> samples;
+    in-out property <[string]> logs;
+    in-out property <string> log-text;
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+
+        // Connection bar
+        HorizontalBox {
+            height: 40px;
+            spacing: 12px;
+
+            Rectangle {
+                width: 12px;
+                height: 12px;
+                border-radius: 6px;
+                background: connected ? #4caf50 : #f44336;
+            }
+
+            Text {
+                text: connected ? "Connected to Volca Sample 2" : "Not Connected";
+                font-size: 16px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: connected ? "Disconnect" : "Connect Device";
+                clicked => { connect-clicked(); }
+                min-width: 150px;
+            }
+
+            Button {
+                text: "Refresh Samples";
+                clicked => { refresh-clicked(); }
+                enabled: connected;
+                min-width: 150px;
+            }
+        }
+
+        // Sample grid - using nested HorizontalLayout rows
+        ScrollView {
+            VerticalBox {
+                padding: 8px;
+                spacing: 8px;
+
+                // Row 0: Slots 0-9
+                HorizontalLayout {
+                    spacing: 8px;
+                    for sample in [samples[0], samples[1], samples[2], samples[3], samples[4], samples[5], samples[6], samples[7], samples[8], samples[9]]: SampleSlot {
+                        sample: sample;
+                        width: 110px;
+                        height: 120px;
+                        upload-clicked => { upload-clicked(sample.slot); }
+                        download-clicked => { download-clicked(sample.slot); }
+                        play-clicked => { play-clicked(sample.slot); }
+                        delete-clicked => { delete-clicked(sample.slot); }
+                    }
+                }
+
+                // Note: This is just for demo - we'll need to generate all 20 rows programmatically
+                // For now, showing just first 2 rows to test the build
+
+                // Row 1: Slots 10-19
+                HorizontalLayout {
+                    spacing: 8px;
+                    for sample in [samples[10], samples[11], samples[12], samples[13], samples[14], samples[15], samples[16], samples[17], samples[18], samples[19]]: SampleSlot {
+                        sample: sample;
+                        width: 110px;
+                        height: 120px;
+                        upload-clicked => { upload-clicked(sample.slot); }
+                        download-clicked => { download-clicked(sample.slot); }
+                        play-clicked => { play-clicked(sample.slot); }
+                        delete-clicked => { delete-clicked(sample.slot); }
+                    }
+                }
+            }
+        }
+
+        // Status bar
+        HorizontalBox {
+            height: 30px;
+            spacing: 12px;
+
+            Text {
+                text: "Samples: ? / 200";
+                font-size: 12px;
+                color: #666;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Text {
+                text: "Status: Ready";
+                font-size: 12px;
+                color: #999;
+                vertical-alignment: center;
+            }
+        }
+
+        // Debug log viewer
+        Rectangle {
+            height: 150px;
+            border-width: 1px;
+            border-color: #cccccc;
+            border-radius: 4px;
+            background: #1e1e1e;
+
+            VerticalBox {
+                padding: 8px;
+
+                Text {
+                    text: "Debug Log";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: #00ff00;
+                }
+
+                TextEdit {
+                    text <=> log-text;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                    height: 120px;
+                }
+            }
+        }
+    }
+}

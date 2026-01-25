@@ -1,0 +1,26 @@
+[package]
+name = "volca-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "macOS GUI application for managing samples on KORG Volca Sample 2"
+
+[dependencies]
+# Volsa2 protocol library (workspace member)
+volsa2-core = { path = "../volsa2-core" }
+
+# GUI and platform
+slint = "1.9"              # GUI framework
+midir = "0.9"              # MIDI communication
+rodio = "0.17"             # Audio playback
+rfd = "0.15"               # Native file dialogs
+
+# Workspace dependencies
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono = "0.4"
+
+[build-dependencies]
+slint-build = "1.9"

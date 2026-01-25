@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:lib.rs)",
+      "Bash(git clone:*)",
+      "Bash(brew search:*)",
+      "WebFetch(domain:korginc.github.io)",
+      "Bash(file:*)",
+      "Bash(xargs ls:*)",
+      "WebFetch(domain:www.boringcactus.com)",
+      "Bash(cargo init:*)",
+      "Bash(curl:*)",
+      "Bash(sh:*)",
+      "Bash(source \"$HOME/.cargo/env\")",
+      "Bash(cargo --version:*)",
+      "Bash(tree:*)",
+      "Bash(cargo check:*)",
+      "Bash($HOME/.cargo/bin/cargo check:*)",
+      "Bash(/Users/mlove/.cargo/bin/cargo check --workspace)",
+      "Bash(/Users/mlove/.cargo/bin/cargo build:*)",
+      "Bash(/Users/mlove/.cargo/bin/cargo install volsa2-cli)",
+      "Bash(/Users/mlove/.cargo/bin/rustc:*)",
+      "Bash(./test-midi)",
+      "Bash(/Users/mlove/.cargo/bin/cargo check)",
+      "Bash(/Users/mlove/.cargo/bin/cargo run)",
+      "Bash(cargo tree:*)",
+      "WebFetch(domain:docs.slint.dev)",
+      "Bash(pkill:*)"
+    ]
+  }
+}
