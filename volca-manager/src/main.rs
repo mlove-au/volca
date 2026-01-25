@@ -482,13 +482,12 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         // TODO: Implement upload
     });
 
-    // Download callback - fetch and display sample info
+    // Download callback - refresh sample from device with loading state
     let state_download = state.clone();
+    let ui_weak_download = ui_weak.clone();
     ui.on_download_clicked(move |slot| {
-        use std::time::Instant;
-
         // Check if sample exists in UI state
-        let _sample = match state_download.get_sample(slot) {
+        let sample = match state_download.get_sample(slot) {
             Some(s) if s.has_sample => s,
             _ => {
                 state_download.log(format!("Slot {} is empty, nothing to download", slot));
@@ -496,131 +495,97 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
             }
         };
 
-        state_download.log(format!("=== Fetching Sample Info from Slot {} ===", slot));
-        state_download.log(format!("Requesting sample header from device..."));
+        let ui = ui_weak_download.unwrap();
 
-        // Check device connection
-        let mut device_guard = state_download.device.lock().unwrap();
-        let device = match device_guard.as_mut() {
-            Some(d) => d,
-            None => {
-                state_download.log("ERROR: Device not connected".to_string());
-                return;
-            }
-        };
+        // Stop any active playback
+        if let Some(sender) = state_download.stop_sender.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        state_download.is_playing.store(false, Ordering::SeqCst);
+        *state_download.playback_info.lock().unwrap() = None;
+        ui.set_is_playing(false);
+        ui.set_playback_position(0.0);
 
-        // Start timing
-        let start_time = Instant::now();
+        // Set loading state BEFORE starting download
+        ui.set_loading_slot(slot);
+        state_download.log(format!("Refreshing slot {}: {}...", slot, sample.name));
 
-        // Fetch sample header
-        state_download.log(format!("Sending SampleHeaderDumpRequest (0x1E) for slot {}...", slot));
+        // Spawn background thread for download
+        let device_ref = state_download.device.clone();
+        let downloaded_ref = state_download.downloaded_samples.clone();
+        let ui_weak = state_download.ui.clone();
 
-        match device.get_sample_info(slot as u8) {
-            Ok(header) => {
-                let elapsed = start_time.elapsed();
+        std::thread::spawn(move || {
+            use std::time::Instant;
+            let start_time = Instant::now();
 
-                state_download.log(format!("✓ Header received successfully in {:.3}s", elapsed.as_secs_f64()));
-                state_download.log(format!(""));
-                state_download.log(format!("--- Sample Metadata ---"));
-                state_download.log(format!("  Slot:     {}", header.sample_no));
-                state_download.log(format!("  Name:     \"{}\"", header.name));
-                state_download.log(format!("  Length:   {} samples", header.length));
+            // Get device and download the sample
+            let mut device_guard = device_ref.lock().unwrap();
+            if let Some(device) = device_guard.as_mut() {
+                // Fetch sample header and data
+                match device.get_sample_info(slot as u8) {
+                    Ok(header) => {
+                        match device.get_sample_data(slot as u8, header.length as usize) {
+                            Ok(sample_data) => {
+                                let elapsed = start_time.elapsed();
 
-                // Calculate duration (sample rate = 31.25 kHz)
-                let duration_secs = header.length as f64 / 31250.0;
-                state_download.log(format!("  Duration: {:.3}s", duration_secs));
+                                // Store in memory
+                                let audio_data_clone = sample_data.data.clone();
+                                downloaded_ref.lock().unwrap().insert(
+                                    slot as u8,
+                                    (audio_data_clone.clone(), header.speed)
+                                );
 
-                state_download.log(format!("  Level:    {}", header.level));
-                state_download.log(format!("  Speed:    {}", header.speed));
+                                // Update UI on main thread
+                                let waveform_data = audio_data_clone.clone();
+                                println!("✓ Refreshed in {:.3}s", elapsed.as_secs_f64());
+                                let ui_weak_clone = ui_weak.clone();
+                                slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = ui_weak_clone.upgrade() {
+                                        // Generate and display waveform
+                                        let width = ui.get_waveform_display_width();
+                                        let height = ui.get_waveform_display_height();
+                                        let waveform_path = generate_waveform_path(&waveform_data, 1000, width as f64, height as f64);
+                                        ui.set_waveform_path(SharedString::from(waveform_path));
 
-                // Calculate file sizes
-                let audio_bytes = header.length as usize * 2; // 16-bit samples
-                let wav_header_size = 44; // Standard WAV header
-                let total_wav_size = audio_bytes + wav_header_size;
-
-                state_download.log(format!(""));
-                state_download.log(format!("--- File Information ---"));
-                state_download.log(format!("  Audio data:      {} bytes ({:.2} KB)",
-                    audio_bytes, audio_bytes as f64 / 1024.0));
-                state_download.log(format!("  WAV file size:   {} bytes ({:.2} KB)",
-                    total_wav_size, total_wav_size as f64 / 1024.0));
-                state_download.log(format!("  Sample rate:     31,250 Hz (Volca Sample 2)"));
-                state_download.log(format!("  Bit depth:       16-bit"));
-                state_download.log(format!("  Channels:        1 (mono)"));
-
-                // Calculate MIDI transfer overhead
-                let midi_encoded_size = (audio_bytes * 8) / 7 +
-                    if (audio_bytes * 8) % 7 != 0 { 1 } else { 0 };
-                let estimated_transfer_time = midi_encoded_size as f64 / (31250.0 / 8.0);
-
-                state_download.log(format!(""));
-                state_download.log(format!("--- MIDI Transfer Information ---"));
-                state_download.log(format!("  Header transfer:  {:.3}s", elapsed.as_secs_f64()));
-                state_download.log(format!("  Header size:      ~39 bytes"));
-                state_download.log(format!("  Data size (MIDI): ~{} bytes (7-bit encoded)", midi_encoded_size));
-                state_download.log(format!("  Est. full xfer:   ~{:.1}s", estimated_transfer_time));
-
-                state_download.log(format!(""));
-                state_download.log(format!("=== Sample Info Complete ==="));
-
-                // Now download the actual sample data
-                state_download.log(format!(""));
-                state_download.log(format!("=== Downloading Sample Data ==="));
-                state_download.log(format!("Sending SampleDataDumpRequest (0x1F) for slot {}...", slot));
-                state_download.log(format!("This may take up to {:.1}s for large samples...", estimated_transfer_time));
-
-                let data_start_time = Instant::now();
-                match device.get_sample_data(slot as u8, header.length as usize) {
-                    Ok(sample_data) => {
-                        let data_elapsed = data_start_time.elapsed();
-                        state_download.log(format!("✓ Sample data received in {:.3}s", data_elapsed.as_secs_f64()));
-                        state_download.log(format!("  Received {} audio samples ({:.2} KB)",
-                            sample_data.data.len(),
-                            (sample_data.data.len() * 2) as f64 / 1024.0));
-
-                        // Store in memory with speed metadata for correct playback
-                        state_download.downloaded_samples.lock().unwrap().insert(slot as u8, (sample_data.data.clone(), header.speed));
-                        state_download.log(format!("✓ Sample stored in memory (slot {}, speed {})", slot, header.speed));
-
-                        // Display the downloaded sample in the waveform viewer
-                        let ui = state_download.ui.upgrade().unwrap();
-                        ui.set_selected_slot(slot);
-                        ui.set_selected_sample_name(SharedString::from(header.name.clone()));
-                        ui.set_selected_sample_length(header.length as i32);
-
-                        // Generate waveform path for visualization
-                        let width = ui.get_waveform_display_width();
-                        let height = ui.get_waveform_display_height();
-                        let waveform_path = generate_waveform_path(&sample_data.data, 1000, width as f64, height as f64);
-                        ui.set_waveform_path(SharedString::from(waveform_path));
-
-                        // Reset zoom and scroll for new sample
-                        ui.set_waveform_zoom(1.0);
-                        ui.set_waveform_scroll(0.0);
-
-                        state_download.log(format!(""));
-                        state_download.log(format!("=== Download Complete ==="));
+                                        // Clear loading state
+                                        ui.set_loading_slot(-1);
+                                    }
+                                }).ok();
+                            }
+                            Err(e) => {
+                                let error_msg = format!("✗ Refresh failed: {}", e);
+                                println!("{}", error_msg);
+                                let ui_weak_clone = ui_weak.clone();
+                                slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = ui_weak_clone.upgrade() {
+                                        ui.set_loading_slot(-1);
+                                    }
+                                }).ok();
+                            }
+                        }
                     }
                     Err(e) => {
-                        let data_elapsed = data_start_time.elapsed();
-                        state_download.log(format!("✗ ERROR: Failed to download sample data after {:.3}s",
-                            data_elapsed.as_secs_f64()));
-                        state_download.log(format!("  Error: {}", e));
+                        let error_msg = format!("✗ Failed to get sample info: {}", e);
+                        println!("{}", error_msg);
+                        let ui_weak_clone = ui_weak.clone();
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak_clone.upgrade() {
+                                ui.set_loading_slot(-1);
+                            }
+                        }).ok();
                     }
                 }
+            } else {
+                println!("ERROR: Device not connected");
+                let ui_weak_clone = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak_clone.upgrade() {
+                        ui.set_loading_slot(-1);
+                    }
+                }).ok();
             }
-            Err(e) => {
-                let elapsed = start_time.elapsed();
-                state_download.log(format!("✗ ERROR: Failed to fetch sample info after {:.3}s",
-                    elapsed.as_secs_f64()));
-                state_download.log(format!("  Error: {}", e));
-
-                // Provide helpful context
-                if e.to_string().contains("timeout") {
-                    state_download.log(format!("  Tip: Device may be slow to respond or slot {} may be empty", slot));
-                }
-            }
-        }
+        });
     });
 
     // Play callback - plays the currently selected sample
