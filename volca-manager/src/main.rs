@@ -3,10 +3,85 @@ slint::include_modules!();
 mod midi;
 
 use midi::MidiDevice;
-use slint::{Model, VecModel, SharedString};
+use slint::{Model, VecModel, SharedString, SharedPixelBuffer, Rgba8Pixel, Image};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
+
+/// Render audio samples to a waveform image
+fn render_waveform(samples: &[i16], width: u32, height: u32) -> Image {
+    let mut pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
+    let pixels = pixel_buffer.make_mut_bytes();
+
+    // Colors (RGBA)
+    let bg_color = [0x0d, 0x0d, 0x1a, 0xff];       // Dark blue background
+    let wave_color = [0x4a, 0x90, 0xe2, 0xff];     // Blue waveform
+    let wave_fill = [0x4a, 0x90, 0xe2, 0x40];      // Semi-transparent fill
+
+    // Fill background
+    for y in 0..height {
+        for x in 0..width {
+            let idx = ((y * width + x) * 4) as usize;
+            pixels[idx..idx + 4].copy_from_slice(&bg_color);
+        }
+    }
+
+    if samples.is_empty() {
+        return Image::from_rgba8(pixel_buffer);
+    }
+
+    let center_y = height as i32 / 2;
+    let max_amplitude = height as i32 / 2 - 2;
+
+    // Calculate samples per pixel (for downsampling)
+    let samples_per_pixel = samples.len() as f64 / width as f64;
+
+    for x in 0..width {
+        // Find min/max sample values for this pixel column
+        let start_sample = (x as f64 * samples_per_pixel) as usize;
+        let end_sample = ((x as f64 + 1.0) * samples_per_pixel) as usize;
+        let end_sample = end_sample.min(samples.len());
+
+        if start_sample >= samples.len() {
+            break;
+        }
+
+        let mut min_val: i16 = i16::MAX;
+        let mut max_val: i16 = i16::MIN;
+
+        for i in start_sample..end_sample {
+            let s = samples[i];
+            min_val = min_val.min(s);
+            max_val = max_val.max(s);
+        }
+
+        // Convert to pixel coordinates
+        let y_min = center_y - (max_val as i32 * max_amplitude / i16::MAX as i32);
+        let y_max = center_y - (min_val as i32 * max_amplitude / i16::MAX as i32);
+
+        let y_min = y_min.max(0).min(height as i32 - 1) as u32;
+        let y_max = y_max.max(0).min(height as i32 - 1) as u32;
+
+        // Draw vertical line for this sample range (filled area)
+        for y in y_min..=y_max {
+            let idx = ((y * width + x) * 4) as usize;
+            // Use fill color for the body
+            pixels[idx..idx + 4].copy_from_slice(&wave_fill);
+        }
+
+        // Draw the outline at min and max
+        if y_min < height {
+            let idx = ((y_min * width + x) * 4) as usize;
+            pixels[idx..idx + 4].copy_from_slice(&wave_color);
+        }
+        if y_max < height && y_max != y_min {
+            let idx = ((y_max * width + x) * 4) as usize;
+            pixels[idx..idx + 4].copy_from_slice(&wave_color);
+        }
+    }
+
+    Image::from_rgba8(pixel_buffer)
+}
 
 pub struct AppState {
     pub samples: Rc<VecModel<SampleInfo>>,
@@ -521,10 +596,26 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
             if sample.has_sample {
                 ui.set_selected_sample_name(sample.name.clone());
                 ui.set_selected_sample_length(sample.length as i32);
-                state_select.log(format!("Selected slot {}: {}", slot, sample.name));
+
+                // Check if we have downloaded audio data for this slot
+                if let Some((audio_data, _speed)) = state_select.downloaded_samples.borrow().get(&(slot as u8)) {
+                    state_select.log(format!("Selected slot {}: {} ({} samples)", slot, sample.name, audio_data.len()));
+
+                    // Render waveform image (use fixed size, will be scaled by UI)
+                    let waveform_image = render_waveform(audio_data, 1200, 200);
+                    ui.set_waveform_image(waveform_image);
+                } else {
+                    state_select.log(format!("Selected slot {}: {} (not downloaded)", slot, sample.name));
+                    // Clear waveform - render empty
+                    let empty_waveform = render_waveform(&[], 1200, 200);
+                    ui.set_waveform_image(empty_waveform);
+                }
             } else {
                 ui.set_selected_sample_name(slint::SharedString::from("Empty slot"));
                 ui.set_selected_sample_length(0);
+                // Clear waveform
+                let empty_waveform = render_waveform(&[], 1200, 200);
+                ui.set_waveform_image(empty_waveform);
             }
         }
 

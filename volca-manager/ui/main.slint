@@ -11,7 +11,7 @@ export struct SampleInfo {
 component WaveformView inherits Rectangle {
     in property <string> sample-name: "No sample selected";
     in property <int> sample-length: 0;
-    in property <[float]> waveform-data: [];
+    in property <image> waveform-image;
     in property <bool> has-waveform: false;
     in-out property <float> zoom-level: 1.0;
     in-out property <float> scroll-position: 0.0;
@@ -122,21 +122,14 @@ component WaveformView inherits Rectangle {
                 vertical-alignment: center;
             }
 
-            // Waveform path (simplified - shows as center line when no data)
-            if has-waveform: Path {
+            // Waveform image rendered from Rust
+            if has-waveform: Image {
                 x: 0;
                 y: 0;
                 width: parent.width;
                 height: parent.height;
-                stroke: #4a90e2;
-                stroke-width: 1px;
-                viewbox-x: scroll-position;
-                viewbox-y: -1;
-                viewbox-width: 1.0 / zoom-level;
-                viewbox-height: 2;
-
-                MoveTo { x: 0; y: 0; }
-                LineTo { x: 1; y: 0; }
+                source: waveform-image;
+                image-fit: fill;
             }
 
             // Y-axis labels
@@ -316,7 +309,7 @@ export component AppWindow inherits Window {
     in-out property <int> selected-slot: -1;
     in-out property <string> selected-sample-name: "No sample selected";
     in-out property <int> selected-sample-length: 0;
-    in-out property <[float]> waveform-data: [];
+    in-out property <image> waveform-image;
     in-out property <float> waveform-zoom: 1.0;
     in-out property <float> waveform-scroll: 0.0;
 
@@ -444,7 +437,7 @@ export component AppWindow inherits Window {
                 min-height: 150px;
                 sample-name: selected-sample-name;
                 sample-length: selected-sample-length;
-                waveform-data: waveform-data;
+                waveform-image: waveform-image;
                 has-waveform: selected-slot >= 0;
                 zoom-level <=> waveform-zoom;
                 scroll-position <=> waveform-scroll;
