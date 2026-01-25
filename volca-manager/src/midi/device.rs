@@ -3,7 +3,7 @@ use coremidi::{Client, Destination, Destinations, InputPort, OutputPort, PacketB
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use volsa2_core::proto::{self, Header, Incoming, Outgoing, SearchDeviceRequest, SearchDeviceReply, SampleHeader, SampleHeaderDumpRequest, SampleData, SampleDataDumpRequest, Status};
+use volsa2_core::proto::{self, Header, Incoming, Outgoing, SearchDeviceRequest, SearchDeviceReply, SampleHeader, SampleHeaderDumpRequest, SampleData, SampleDataDumpRequest};
 use volsa2_core::seven_bit::U7;
 
 const DEVICE_NAME: &str = "volca sample";

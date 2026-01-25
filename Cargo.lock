@@ -5342,6 +5342,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "coremidi",
+ "hound",
  "rfd",
  "rodio",
  "slint",

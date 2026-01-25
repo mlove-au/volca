@@ -91,6 +91,48 @@ fn generate_waveform_path(samples: &[i16], num_points: usize, width: f64, height
     path
 }
 
+/// Load WAV file and prepare for Volca Sample 2
+/// Returns (samples, speed, sample_rate_khz) or error
+fn load_wav_file(path: &std::path::Path) -> Result<(Vec<i16>, u16, f32), String> {
+    use volsa2_core::audio::{AudioReader, VOLCA_SAMPLERATE};
+
+    // First, read the WAV spec to get original sample rate
+    let wav_reader = hound::WavReader::open(path)
+        .map_err(|e| format!("Failed to open WAV: {}", e))?;
+    let spec = wav_reader.spec();
+    let original_sample_rate = spec.sample_rate;
+    drop(wav_reader);  // Close the reader so AudioReader can open it
+
+    // Now use AudioReader for proper processing
+    let audio = AudioReader::open_file(path)
+        .map_err(|e| format!("Failed to open WAV: {}", e))?;
+
+    let channels = audio.channels();
+
+    // Convert to mono and resample as needed
+    let samples = match channels {
+        1 => audio.resample_to_volca(),  // Already mono
+        _ => audio.take_mid().resample_to_volca(),  // Convert stereo to mono (L+R)/2
+    }
+    .map_err(|e| format!("Failed to process audio: {}", e))?;
+
+    // Calculate speed parameter for playback
+    // speed = (original_rate / 31250) * 16384
+    // If we resampled DOWN (original > 31.25kHz), speed stays at 16384 (1.0x)
+    // If original was lower, speed adjusts for slower playback
+    let speed = if original_sample_rate > VOLCA_SAMPLERATE {
+        16384  // Resampled to 31.25kHz, play at 1x
+    } else {
+        // Calculate speed for lower sample rates
+        ((original_sample_rate as f32 / VOLCA_SAMPLERATE as f32) * 16384.0) as u16
+    };
+
+    // Calculate display sample rate in kHz
+    let display_rate_khz = 31.25 * speed as f32 / 16384.0;
+
+    Ok((samples, speed, display_rate_khz))
+}
+
 pub struct AppState {
     pub samples: Rc<VecModel<SampleInfo>>,
     pub connected: bool,
@@ -407,21 +449,6 @@ fn main() -> Result<(), slint::PlatformError> {
                         let elapsed = start_time.elapsed().as_secs_f64();
                         let position = (elapsed / duration).min(1.0);
                         ui.set_playback_position(position as f32);
-
-                        // Auto-scroll when zoomed: keep playhead at 75% of visible area
-                        let zoom = ui.get_waveform_zoom();
-                        if zoom > 1.0 {
-                            let visible_range = 1.0 / zoom;
-                            let current_scroll = ui.get_waveform_scroll();
-                            let playhead_in_view = (position - current_scroll as f64) / visible_range as f64;
-
-                            // Scroll when playhead reaches 75% of visible area
-                            if playhead_in_view > 0.75 {
-                                let new_scroll = (position - 0.75 * visible_range as f64) as f32;
-                                let max_scroll = 1.0 - 1.0 / zoom;
-                                ui.set_waveform_scroll(new_scroll.min(max_scroll).max(0.0));
-                            }
-                        }
                     }
                 }
             }
@@ -849,32 +876,89 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         }
     });
 
-    // Waveform zoom callbacks
-    let ui_weak_zoom_in = ui_weak.clone();
-    ui.on_waveform_zoom_in(move || {
-        let ui = ui_weak_zoom_in.unwrap();
-        let current_zoom = ui.get_waveform_zoom();
-        let new_zoom = (current_zoom * 1.5).min(10.0); // Max 10x zoom
-        ui.set_waveform_zoom(new_zoom);
-    });
+    // Load WAV callback - replace sample audio without writing to device
+    let state_load_wav = state.clone();
+    let ui_weak_load_wav = ui_weak.clone();
+    ui.on_load_wav_clicked(move || {
+        let ui = ui_weak_load_wav.unwrap();
+        let slot = ui.get_selected_slot();
 
-    let ui_weak_zoom_out = ui_weak.clone();
-    ui.on_waveform_zoom_out(move || {
-        let ui = ui_weak_zoom_out.unwrap();
-        let current_zoom = ui.get_waveform_zoom();
-        let new_zoom = (current_zoom / 1.5).max(1.0); // Min 1x zoom
-        ui.set_waveform_zoom(new_zoom);
-        // Reset scroll if we can see the whole waveform
-        if new_zoom <= 1.0 {
-            ui.set_waveform_scroll(0.0);
+        if slot < 0 || slot >= 200 {
+            println!("No slot selected for WAV load");
+            return;
         }
-    });
 
-    let ui_weak_zoom_reset = ui_weak.clone();
-    ui.on_waveform_zoom_reset(move || {
-        let ui = ui_weak_zoom_reset.unwrap();
-        ui.set_waveform_zoom(1.0);
-        ui.set_waveform_scroll(0.0);
+        // Open file dialog (rfd already in Cargo.toml)
+        let file = rfd::FileDialog::new()
+            .add_filter("WAV Audio", &["wav", "WAV"])
+            .set_title("Select WAV file to load")
+            .pick_file();
+
+        let Some(path) = file else {
+            println!("No file selected");
+            return;
+        };
+
+        println!("Loading WAV: {:?}", path);
+
+        // Load and process WAV file
+        match load_wav_file(&path) {
+            Ok((samples, speed, display_rate_khz)) => {
+                let sample_count = samples.len();
+                let duration_secs = sample_count as f32 / 31250.0;
+
+                println!("Loaded {} samples ({:.2}s) at {:.2} kHz",
+                         sample_count, duration_secs, display_rate_khz);
+
+                // Extract filename for display
+                let filename = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Untitled")
+                    .to_string();
+
+                // Truncate to 24 chars (Volca limit)
+                let name = if filename.len() > 24 {
+                    filename.chars().take(24).collect()
+                } else {
+                    filename
+                };
+
+                // Store in downloaded_samples (in-memory only, not on device)
+                state_load_wav.downloaded_samples.lock().unwrap().insert(
+                    slot as u8,
+                    (samples.clone(), speed)
+                );
+
+                // Update SampleInfo with new metadata and mark as edited
+                let updated_info = SampleInfo {
+                    slot,
+                    name: SharedString::from(&name),
+                    length: sample_count as i32,
+                    speed: speed as i32,
+                    has_sample: true,
+                    name_edited: true,  // Mark as edited (shows ✏️)
+                };
+                state_load_wav.samples.set_row_data(slot as usize, updated_info);
+
+                // Regenerate waveform display
+                let width = ui.get_waveform_display_width();
+                let height = ui.get_waveform_display_height();
+                let waveform_path = generate_waveform_path(&samples, 1000, width as f64, height as f64);
+
+                // Update UI
+                ui.set_selected_sample_name(SharedString::from(&name));
+                ui.set_selected_sample_length(sample_count as i32);
+                ui.set_waveform_path(SharedString::from(waveform_path));
+                ui.set_samples(state_load_wav.samples.clone().into());
+
+                state_load_wav.log(format!("Loaded WAV: {} ({:.2}s, {:.2} kHz) - not saved to device",
+                                           name, duration_secs, display_rate_khz));
+            }
+            Err(e) => {
+                println!("ERROR loading WAV: {}", e);
+                state_load_wav.log(format!("Failed to load WAV: {}", e));
+            }
+        }
     });
 
     // Name edit accepted callback - update name and set edited flag
