@@ -19,14 +19,15 @@ component SamplePad inherits Rectangle {
     border-color: sample.has-sample ? #4a90e2 : #cccccc;
     background: sample.has-sample ? #f0f8ff : #f9f9f9;
 
-    VerticalBox {
-        padding: 12px;
-        spacing: 6px;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 4px;
+        alignment: stretch;
 
         // Slot number
         Text {
             text: sample.slot < 10 ? "00" + sample.slot : (sample.slot < 100 ? "0" + sample.slot : "" + sample.slot);
-            font-size: 16px;
+            font-size: 14px;
             font-weight: 700;
             color: #666;
             horizontal-alignment: center;
@@ -35,29 +36,30 @@ component SamplePad inherits Rectangle {
         // Sample name or empty indicator
         Text {
             text: sample.has-sample ? sample.name : "(empty)";
-            font-size: 16px;
+            font-size: 12px;
             font-weight: sample.has-sample ? 600 : 400;
             color: sample.has-sample ? #333 : #999;
             overflow: elide;
             horizontal-alignment: center;
         }
 
-        // Length display
+        // Length display (rounded to 1 decimal place)
         if sample.has-sample: Text {
-            text: (sample.length / 31250) + "s";
-            font-size: 13px;
+            text: round(sample.length / 3125.0) / 10.0 + "s";
+            font-size: 11px;
             color: #666;
             horizontal-alignment: center;
         }
 
-        // Spacer
+        // Spacer - pushes buttons to bottom
         Rectangle {
             vertical-stretch: 1;
         }
 
-        // Action buttons
+        // Action buttons - anchored at bottom
         HorizontalLayout {
             spacing: 4px;
+            alignment: center;
 
             if sample.has-sample: Button {
                 text: "▶";
@@ -84,8 +86,9 @@ component SamplePad inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Volca Sample 2 Manager";
-    preferred-width: 1400px;
-    preferred-height: 900px;
+    preferred-width: 800px;
+    preferred-height: show-debug-log ? 520px : 380px;
+    default-font-family: "SF Mono";
 
     callback connect-clicked();
     callback refresh-clicked();
@@ -95,21 +98,34 @@ export component AppWindow inherits Window {
     callback delete-clicked(int);
     callback prev-page-clicked();
     callback next-page-clicked();
+    callback toggle-debug-log();
 
     in-out property <bool> connected: false;
     in-out property <[SampleInfo]> samples;
     in-out property <[string]> logs;
     in-out property <string> log-text;
     in-out property <int> current-page: 0;
-    in-out property <int> total-pages: 10; // 200 slots / 20 per page = 10 pages
+    in-out property <int> total-pages: 20; // 200 slots / 10 per page = 20 pages
     in-out property <bool> scanning: false;
+    in-out property <bool> show-debug-log: false;
 
-    // Calculate which samples to display (20 per page)
-    property <int> start-slot: current-page * 20;
+    // Calculate which samples to display (10 per page - 5x2 grid)
+    property <int> start-slot: current-page * 10;
 
-    VerticalBox {
-        padding: 16px;
-        spacing: 12px;
+    FocusScope {
+        init => { self.focus(); }
+
+        key-pressed(event) => {
+            if ((event.modifiers.meta || event.modifiers.control) && event.text == "d") {
+                toggle-debug-log();
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
 
         // Connection bar
         HorizontalBox {
@@ -162,7 +178,7 @@ export component AppWindow inherits Window {
             }
 
             Text {
-                text: "Page " + (current-page + 1) + " / " + total-pages + "  (Slots " + start-slot + "-" + (start-slot + 19) + ")";
+                text: "Page " + (current-page + 1) + " / " + total-pages + "  (Slots " + start-slot + "-" + (start-slot + 9) + ")";
                 font-size: 16px;
                 font-weight: 600;
                 horizontal-alignment: center;
@@ -176,7 +192,7 @@ export component AppWindow inherits Window {
             }
         }
 
-        // 4x5 Sample Grid
+        // 5x2 Sample Grid (10 samples per page, room for waveforms)
         VerticalBox {
             spacing: 12px;
             padding: 8px;
@@ -186,8 +202,8 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 for i in [0, 1, 2, 3, 4]: SamplePad {
                     sample: samples[start-slot + i];
-                    width: 200px;
-                    height: 160px;
+                    width: 130px;
+                    height: 110px;
                     upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                     download-clicked => { download-clicked(samples[start-slot + i].slot); }
                     play-clicked => { play-clicked(samples[start-slot + i].slot); }
@@ -200,42 +216,19 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 for i in [5, 6, 7, 8, 9]: SamplePad {
                     sample: samples[start-slot + i];
-                    width: 200px;
-                    height: 160px;
+                    width: 130px;
+                    height: 110px;
                     upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                     download-clicked => { download-clicked(samples[start-slot + i].slot); }
                     play-clicked => { play-clicked(samples[start-slot + i].slot); }
                     delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
                 }
             }
+        }
 
-            // Row 3: Slots 10-14 (relative to page)
-            HorizontalLayout {
-                spacing: 12px;
-                for i in [10, 11, 12, 13, 14]: SamplePad {
-                    sample: samples[start-slot + i];
-                    width: 200px;
-                    height: 160px;
-                    upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
-                    download-clicked => { download-clicked(samples[start-slot + i].slot); }
-                    play-clicked => { play-clicked(samples[start-slot + i].slot); }
-                    delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
-                }
-            }
-
-            // Row 4: Slots 15-19 (relative to page)
-            HorizontalLayout {
-                spacing: 12px;
-                for i in [15, 16, 17, 18, 19]: SamplePad {
-                    sample: samples[start-slot + i];
-                    width: 200px;
-                    height: 160px;
-                    upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
-                    download-clicked => { download-clicked(samples[start-slot + i].slot); }
-                    play-clicked => { play-clicked(samples[start-slot + i].slot); }
-                    delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
-                }
-            }
+        // Spacer to push status bar to bottom
+        Rectangle {
+            vertical-stretch: 1;
         }
 
         // Status bar
@@ -260,33 +253,41 @@ export component AppWindow inherits Window {
                 color: #999;
                 vertical-alignment: center;
             }
+
+            Button {
+                text: show-debug-log ? "Hide Log" : "Show Log";
+                clicked => { toggle-debug-log(); }
+            }
         }
 
-        // Debug log viewer
-        Rectangle {
+        // Debug log viewer (toggle with Cmd+D)
+        if show-debug-log: Rectangle {
             height: 150px;
             border-width: 1px;
             border-color: #cccccc;
             border-radius: 4px;
             background: #1e1e1e;
 
-            VerticalBox {
+            VerticalLayout {
                 padding: 8px;
+                spacing: 4px;
 
                 Text {
-                    text: "Debug Log";
+                    text: "Debug Log (Cmd+D to hide)";
                     font-size: 11px;
                     font-weight: 700;
                     color: #00ff00;
+                    height: 16px;
                 }
 
                 TextEdit {
                     text <=> log-text;
                     font-size: 10px;
-                    wrap: word-wrap;
-                    height: 120px;
+                    read-only: true;
+                    vertical-stretch: 1;
                 }
             }
         }
+    }
     }
 }

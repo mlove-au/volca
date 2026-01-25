@@ -498,4 +498,14 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
             ui.set_current_page(current + 1);
         }
     });
+
+    // Debug log toggle callback (Cmd+D)
+    let ui_weak_toggle = ui_weak.clone();
+    ui.on_toggle_debug_log(move || {
+        println!("DEBUG: toggle_debug_log callback triggered!");
+        let ui = ui_weak_toggle.unwrap();
+        let current = ui.get_show_debug_log();
+        println!("DEBUG: current show_debug_log = {}, setting to {}", current, !current);
+        ui.set_show_debug_log(!current);
+    });
 }
