@@ -230,6 +230,7 @@ component WaveformView inherits Rectangle {
 component SamplePad inherits Rectangle {
     in property <SampleInfo> sample;
     in property <bool> selected: false;
+    in property <bool> is-loading: false;
     callback upload-clicked();
     callback download-clicked();
     callback delete-clicked();
@@ -237,7 +238,7 @@ component SamplePad inherits Rectangle {
 
     border-radius: 8px;
     border-width: selected ? 3px : 2px;
-    border-color: selected ? #ff9800 : (sample.has-sample ? #4a90e2 : #cccccc);
+    border-color: is-loading ? #999999 : (selected ? #ff9800 : (sample.has-sample ? #4a90e2 : #cccccc));
     background: sample.has-sample ? #f0f8ff : #f9f9f9;
 
     // Make the whole pad clickable
@@ -250,13 +251,24 @@ component SamplePad inherits Rectangle {
         spacing: 3px;
         alignment: stretch;
 
-        // Slot number
-        Text {
-            text: sample.slot < 10 ? "00" + sample.slot : (sample.slot < 100 ? "0" + sample.slot : "" + sample.slot);
-            font-size: 13px;
-            font-weight: 700;
-            color: #666;
-            horizontal-alignment: center;
+        // Slot number with loading indicator
+        HorizontalLayout {
+            alignment: center;
+            spacing: 4px;
+
+            Text {
+                text: sample.slot < 10 ? "00" + sample.slot : (sample.slot < 100 ? "0" + sample.slot : "" + sample.slot);
+                font-size: 13px;
+                font-weight: 700;
+                color: #666;
+                horizontal-alignment: center;
+            }
+
+            if is-loading: Text {
+                text: "⏳";
+                font-size: 12px;
+                horizontal-alignment: center;
+            }
         }
 
         // Sample name or empty indicator
@@ -341,6 +353,7 @@ export component AppWindow inherits Window {
 
     in-out property <bool> connected: false;
     in-out property <[SampleInfo]> samples;
+    in-out property <int> loading-slot: -1;  // Track which slot is currently loading (-1 = none)
     in-out property <[string]> logs;
     in-out property <string> log-text;
     in-out property <int> current-page: 0;
@@ -452,6 +465,7 @@ export component AppWindow inherits Window {
                         width: 130px;
                         height: 120px;
                         selected: selected-slot == samples[start-slot + i].slot;
+                        is-loading: loading-slot == samples[start-slot + i].slot;
                         upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                         download-clicked => { download-clicked(samples[start-slot + i].slot); }
                         delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
@@ -468,6 +482,7 @@ export component AppWindow inherits Window {
                         width: 130px;
                         height: 120px;
                         selected: selected-slot == samples[start-slot + i].slot;
+                        is-loading: loading-slot == samples[start-slot + i].slot;
                         upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                         download-clicked => { download-clicked(samples[start-slot + i].slot); }
                         delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
