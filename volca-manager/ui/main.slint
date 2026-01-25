@@ -195,7 +195,6 @@ component SamplePad inherits Rectangle {
     in property <bool> selected: false;
     callback upload-clicked();
     callback download-clicked();
-    callback play-clicked();
     callback delete-clicked();
     callback pad-clicked();
 
@@ -252,11 +251,6 @@ component SamplePad inherits Rectangle {
             alignment: center;
 
             if sample.has-sample: Button {
-                text: "▶";
-                clicked => { play-clicked(); }
-            }
-
-            if sample.has-sample: Button {
                 text: "💾";
                 clicked => { download-clicked(); }
             }
@@ -286,7 +280,6 @@ export component AppWindow inherits Window {
     callback refresh-clicked();
     callback upload-clicked(int);
     callback download-clicked(int);
-    callback play-clicked(int);
     callback delete-clicked(int);
     callback prev-page-clicked();
     callback next-page-clicked();
@@ -295,6 +288,8 @@ export component AppWindow inherits Window {
     callback waveform-zoom-in();
     callback waveform-zoom-out();
     callback waveform-zoom-reset();
+    callback play-clicked();
+    callback stop-clicked();
 
     in-out property <bool> connected: false;
     in-out property <[SampleInfo]> samples;
@@ -312,6 +307,7 @@ export component AppWindow inherits Window {
     in-out property <image> waveform-image;
     in-out property <float> waveform-zoom: 1.0;
     in-out property <float> waveform-scroll: 0.0;
+    in-out property <bool> is-playing: false;
 
     // Calculate which samples to display (10 per page - 5x2 grid)
     property <int> start-slot: current-page * 10;
@@ -407,7 +403,6 @@ export component AppWindow inherits Window {
                         selected: selected-slot == samples[start-slot + i].slot;
                         upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                         download-clicked => { download-clicked(samples[start-slot + i].slot); }
-                        play-clicked => { play-clicked(samples[start-slot + i].slot); }
                         delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
                         pad-clicked => { pad-selected(samples[start-slot + i].slot); }
                     }
@@ -424,7 +419,6 @@ export component AppWindow inherits Window {
                         selected: selected-slot == samples[start-slot + i].slot;
                         upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
                         download-clicked => { download-clicked(samples[start-slot + i].slot); }
-                        play-clicked => { play-clicked(samples[start-slot + i].slot); }
                         delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
                         pad-clicked => { pad-selected(samples[start-slot + i].slot); }
                     }
@@ -444,6 +438,25 @@ export component AppWindow inherits Window {
                 zoom-in => { waveform-zoom-in(); }
                 zoom-out => { waveform-zoom-out(); }
                 zoom-reset => { waveform-zoom-reset(); }
+            }
+
+            // Playback controls
+            HorizontalLayout {
+                height: 32px;
+                spacing: 8px;
+                alignment: center;
+
+                Button {
+                    text: is-playing ? "▶ Playing..." : "▶ Play";
+                    enabled: selected-slot >= 0 && !is-playing;
+                    clicked => { play-clicked(); }
+                }
+
+                Button {
+                    text: "⏹ Stop";
+                    enabled: is-playing;
+                    clicked => { stop-clicked(); }
+                }
             }
 
             // Status bar

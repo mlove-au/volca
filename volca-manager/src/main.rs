@@ -7,6 +7,9 @@ use slint::{Model, VecModel, SharedString, SharedPixelBuffer, Rgba8Pixel, Image}
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Render audio samples to a waveform image
 fn render_waveform(samples: &[i16], width: u32, height: u32) -> Image {
@@ -91,6 +94,8 @@ pub struct AppState {
     pub logs: Rc<VecModel<SharedString>>,
     pub ui: slint::Weak<AppWindow>,
     pub downloaded_samples: Rc<RefCell<HashMap<u8, (Vec<i16>, u16)>>>,  // (audio_data, speed)
+    pub stop_sender: Rc<RefCell<Option<Sender<()>>>>,  // Channel to signal stop playback
+    pub is_playing: Arc<AtomicBool>,  // Thread-safe playback state
 }
 
 impl AppState {
@@ -153,6 +158,8 @@ impl AppState {
             logs: Rc::new(VecModel::default()),
             ui,
             downloaded_samples: Rc::new(RefCell::new(HashMap::new())),
+            stop_sender: Rc::new(RefCell::new(None)),
+            is_playing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -241,20 +248,36 @@ impl Clone for AppState {
             logs: self.logs.clone(),
             ui: self.ui.clone(),
             downloaded_samples: self.downloaded_samples.clone(),
+            stop_sender: self.stop_sender.clone(),
+            is_playing: self.is_playing.clone(),
         }
     }
 }
 
 /// Play audio samples using rodio with speed-adjusted sample rate
-fn play_audio_sample(samples: &[i16], speed: u16) -> Result<(), Box<dyn std::error::Error>> {
+/// Returns true if playback completed, false if stopped early
+fn play_audio_sample(samples: &[i16], speed: u16, stop_receiver: mpsc::Receiver<()>) -> bool {
     use rodio::{OutputStream, Sink};
     use rodio::buffer::SamplesBuffer;
+    use std::time::Duration;
 
     println!("DEBUG: play_audio_sample called with {} samples, speed {}", samples.len(), speed);
 
     // Create output stream
-    let (_stream, stream_handle) = OutputStream::try_default()?;
-    let sink = Sink::try_new(&stream_handle)?;
+    let (_stream, stream_handle) = match OutputStream::try_default() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to create audio output: {}", e);
+            return false;
+        }
+    };
+    let sink = match Sink::try_new(&stream_handle) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to create audio sink: {}", e);
+            return false;
+        }
+    };
 
     // Volca Sample 2 base specs: 31,250 Hz, mono, 16-bit
     // Speed is a fixed-point value where 16384 = 1.0x
@@ -266,8 +289,6 @@ fn play_audio_sample(samples: &[i16], speed: u16) -> Result<(), Box<dyn std::err
     let sample_rate = (BASE_RATE as f64 * (speed as f64 / DEFAULT_SPEED as f64)) as u32;
 
     println!("DEBUG: Creating SamplesBuffer with {} samples at {} Hz (speed {})", samples.len(), sample_rate, speed);
-    let duration_secs = samples.len() as f64 / sample_rate as f64;
-    println!("DEBUG: Expected playback duration: {:.3}s", duration_secs);
 
     // Create audio buffer from i16 samples
     let buffer = SamplesBuffer::new(CHANNELS, sample_rate, samples.to_vec());
@@ -275,10 +296,29 @@ fn play_audio_sample(samples: &[i16], speed: u16) -> Result<(), Box<dyn std::err
     // Add to sink and play
     sink.append(buffer);
     println!("DEBUG: Starting playback...");
-    sink.sleep_until_end();
-    println!("DEBUG: Playback complete");
 
-    Ok(())
+    // Poll for completion or stop signal
+    loop {
+        // Check if playback finished
+        if sink.empty() {
+            println!("DEBUG: Playback complete");
+            return true;
+        }
+
+        // Check for stop signal (non-blocking)
+        match stop_receiver.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                println!("DEBUG: Stop signal received");
+                sink.stop();
+                return false;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Continue playing
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -326,6 +366,23 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_connected(false);
         }
     }
+
+    // Timer to sync playback state from thread to UI
+    let is_playing_timer = app_state.is_playing.clone();
+    let ui_weak_timer = ui.as_weak();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(100),
+        move || {
+            if let Some(ui) = ui_weak_timer.upgrade() {
+                let playing = is_playing_timer.load(Ordering::SeqCst);
+                if ui.get_is_playing() != playing {
+                    ui.set_is_playing(playing);
+                }
+            }
+        },
+    );
 
     // Run the application
     ui.run()
@@ -509,37 +566,56 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         }
     });
 
-    // Play callback
+    // Play callback - plays the currently selected sample
     let state_play = state.clone();
-    ui.on_play_clicked(move |slot| {
+    let ui_weak_play = ui_weak.clone();
+    ui.on_play_clicked(move || {
+        let ui = ui_weak_play.unwrap();
+        let slot = ui.get_selected_slot();
+
+        if slot < 0 {
+            state_play.log("No sample selected".to_string());
+            return;
+        }
+
         if let Some(sample) = state_play.get_sample(slot) {
             if sample.has_sample {
-                state_play.log(format!("Play slot {}: {}", slot, sample.name));
-
                 // Check if we have the sample data in memory
                 if let Some((audio_data, speed)) = state_play.downloaded_samples.borrow().get(&(slot as u8)) {
                     let sample_count = audio_data.len();
-                    // Calculate effective sample rate for display
                     let effective_rate = (31250.0 * (*speed as f64 / 16384.0)) as u32;
-                    state_play.log(format!("Playing {} samples at {} Hz (speed {})...", sample_count, effective_rate, speed));
+                    state_play.log(format!("Playing {} ({} samples at {} Hz)", sample.name, sample_count, effective_rate));
+
+                    // Create stop channel
+                    let (tx, rx) = mpsc::channel();
+                    *state_play.stop_sender.borrow_mut() = Some(tx);
+
+                    // Set playing state
+                    state_play.is_playing.store(true, Ordering::SeqCst);
+                    ui.set_is_playing(true);
 
                     // Play the audio in a background thread
                     let audio_clone = audio_data.clone();
                     let speed_clone = *speed;
+                    let is_playing_flag = state_play.is_playing.clone();
                     std::thread::spawn(move || {
-                        match play_audio_sample(&audio_clone, speed_clone) {
-                            Ok(()) => {
-                                println!("✓ Playback complete");
-                            }
-                            Err(e) => {
-                                eprintln!("✗ Playback error: {}", e);
-                            }
-                        }
+                        let completed = play_audio_sample(&audio_clone, speed_clone, rx);
+                        println!("Playback {}", if completed { "complete" } else { "stopped" });
+                        is_playing_flag.store(false, Ordering::SeqCst);
                     });
                 } else {
-                    state_play.log(format!("Sample not downloaded yet. Click the download button first."));
+                    state_play.log(format!("Sample not downloaded yet. Click 💾 to download first."));
                 }
             }
+        }
+    });
+
+    // Stop callback
+    let state_stop = state.clone();
+    ui.on_stop_clicked(move || {
+        if let Some(sender) = state_stop.stop_sender.borrow_mut().take() {
+            let _ = sender.send(());
+            state_stop.log("Stopping playback...".to_string());
         }
     });
 
