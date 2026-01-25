@@ -81,35 +81,63 @@ impl AppState {
         }
     }
 
-    /// Load mock data for testing UI
-    pub fn load_mock_data(&mut self) {
-        let mock_samples = vec![
-            (0, "Kick", 31250),
-            (1, "Snare", 15625),
-            (2, "HiHat", 7812),
-            (4, "Clap", 12500),
-            (6, "Perc", 10000),
-            (7, "Bass", 62500),
-            (10, "Synth", 93750),
-            (12, "FX", 20000),
-            (13, "Vox", 156250),
-            (15, "Loop", 125000),
-            (16, "Drum", 31250),
-            (25, "Tom", 25000),
-            (50, "Crash", 50000),
-            (99, "Ambient", 200000),
-            (100, "Lead", 80000),
-            (150, "Pad", 180000),
-            (199, "Noise", 15000),
-        ];
+    /// Scan all 200 sample slots from the device
+    pub fn scan_all_samples(&self) {
+        self.log("Starting scan of all 200 sample slots...".to_string());
 
-        for (slot, name, length) in mock_samples {
-            self.samples.set_row_data(slot as usize, SampleInfo {
-                slot,
-                name: SharedString::from(name),
-                length,
-                has_sample: true,
-            });
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_scanning(true);
+        }
+
+        let mut device_opt = self.device.borrow_mut();
+        if let Some(device) = device_opt.as_mut() {
+            let mut samples_found = 0;
+
+            for slot in 0..200 {
+                // Log progress every 20 slots
+                if slot % 20 == 0 {
+                    self.log(format!("Scanning slots {}-{}...", slot, (slot + 19).min(199)));
+                }
+
+                match device.get_sample_info(slot as u8) {
+                    Ok(header) => {
+                        let has_sample = header.length > 0;
+                        if has_sample {
+                            samples_found += 1;
+                        }
+
+                        self.samples.set_row_data(slot as usize, SampleInfo {
+                            slot: slot as i32,
+                            name: SharedString::from(if has_sample { header.name.as_str() } else { "(empty)" }),
+                            length: header.length as i32,
+                            has_sample,
+                        });
+
+                        // Update UI periodically
+                        if let Some(ui) = self.ui.upgrade() {
+                            ui.set_samples(self.samples.clone().into());
+                        }
+                    }
+                    Err(e) => {
+                        self.log(format!("Error reading slot {}: {}", slot, e));
+                        // Set as empty on error
+                        self.samples.set_row_data(slot as usize, SampleInfo {
+                            slot: slot as i32,
+                            name: SharedString::from("(error)"),
+                            length: 0,
+                            has_sample: false,
+                        });
+                    }
+                }
+            }
+
+            self.log(format!("Scan complete! Found {} samples in 200 slots.", samples_found));
+        } else {
+            self.log("Error: No device connected".to_string());
+        }
+
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_scanning(false);
         }
     }
 
@@ -176,12 +204,13 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui_weak = ui.as_weak();
 
     // Create application state with UI reference
-    let mut app_state = AppState::new(ui_weak);
-    app_state.load_mock_data();
+    let app_state = AppState::new(ui_weak);
 
     // Set the sample model in the UI
     ui.set_samples(app_state.samples.clone().into());
     ui.set_connected(false);
+    ui.set_scanning(false);
+    ui.set_current_page(0);
     ui.set_logs(app_state.logs.clone().into());
     ui.set_log_text(SharedString::from(""));
 
@@ -189,7 +218,26 @@ fn main() -> Result<(), slint::PlatformError> {
     app_state.log("Application started".to_string());
 
     // Setup callbacks
-    setup_callbacks(&ui, app_state);
+    setup_callbacks(&ui, app_state.clone());
+
+    // Auto-connect on startup
+    app_state.log("Auto-connecting to Volca Sample 2...".to_string());
+    match MidiDevice::connect() {
+        Ok(device) => {
+            let firmware = device.firmware_version.clone();
+            *app_state.device.borrow_mut() = Some(device);
+            ui.set_connected(true);
+            app_state.log(format!("Successfully connected! Firmware: {}", firmware));
+
+            // Auto-scan samples on connect
+            app_state.log("Auto-scanning all sample slots...".to_string());
+            app_state.scan_all_samples();
+        }
+        Err(e) => {
+            app_state.log(format!("Auto-connect failed: {}. Click Connect to retry.", e));
+            ui.set_connected(false);
+        }
+    }
 
     // Run the application
     ui.run()
@@ -220,6 +268,9 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                     *state_connect.device.borrow_mut() = Some(device);
                     ui.set_connected(true);
                     state_connect.log(format!("Successfully connected! Firmware: {}", firmware));
+
+                    // Auto-scan on connect
+                    state_connect.scan_all_samples();
                 }
                 Err(e) => {
                     state_connect.log(format!("Failed to connect: {}", e));
@@ -229,16 +280,11 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         }
     });
 
-    // Refresh button callback
-    let ui_weak_refresh = ui_weak.clone();
+    // Scan/Refresh button callback
     let state_refresh = state.clone();
     ui.on_refresh_clicked(move || {
-        let ui = ui_weak_refresh.unwrap();
-        state_refresh.log("Refresh clicked - reloading mock data".to_string());
-
-        // In real implementation, this would scan the device
-        // For now, just show the mock data is still there
-        ui.set_samples(state_refresh.samples.clone().into());
+        state_refresh.log("Scan button clicked - scanning all samples...".to_string());
+        state_refresh.scan_all_samples();
     });
 
     // Upload callback
@@ -415,5 +461,25 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
             }
         }
         // TODO: Implement delete
+    });
+
+    // Page navigation callbacks
+    let ui_weak_prev = ui_weak.clone();
+    ui.on_prev_page_clicked(move || {
+        let ui = ui_weak_prev.unwrap();
+        let current = ui.get_current_page();
+        if current > 0 {
+            ui.set_current_page(current - 1);
+        }
+    });
+
+    let ui_weak_next = ui_weak.clone();
+    ui.on_next_page_clicked(move || {
+        let ui = ui_weak_next.unwrap();
+        let current = ui.get_current_page();
+        let total = ui.get_total_pages();
+        if current < total - 1 {
+            ui.set_current_page(current + 1);
+        }
     });
 }

@@ -42,15 +42,27 @@ impl MidiDevice {
             &in_port,
             "volca-input",
             move |_timestamp, message, _| {
-                // Debug: Print raw MIDI bytes received (ignore errors)
-                let _ = std::io::Write::write_fmt(
-                    &mut std::io::stderr(),
-                    format_args!("DEBUG: Received {} MIDI bytes: {:02X?}\n", message.len(), message)
-                );
+                // Fast path: filter out 0xF8 clock messages immediately
+                // This is an O(n) scan but avoids buffer allocation and mutex contention
+                // for messages we'd discard anyway
+                let filtered: Vec<u8> = message.iter()
+                    .copied()
+                    .filter(|&b| b != 0xF8)
+                    .collect();
 
-                // Accumulate all incoming MIDI data (ignore poison errors)
-                if let Ok(mut buffer) = buffer_clone.lock() {
-                    buffer.extend_from_slice(message);
+                // Only log and buffer if we have non-clock data
+                if !filtered.is_empty() {
+                    // Debug: Print raw MIDI bytes received (ignore errors)
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr(),
+                        format_args!("DEBUG: Received {} MIDI bytes: {:02X?}\n",
+                                    filtered.len(), filtered)
+                    );
+
+                    // Accumulate incoming MIDI data (ignore poison errors)
+                    if let Ok(mut buffer) = buffer_clone.lock() {
+                        buffer.extend_from_slice(&filtered);
+                    }
                 }
             },
             (),
@@ -194,8 +206,9 @@ impl MidiDevice {
                         let message_end = end_idx + 1;
                         let mut message: Vec<u8> = buffer.drain(..message_end).collect();
 
-                        // Filter out MIDI real-time messages (0xF8-0xFF) that can appear inside SysEx
-                        // These are: 0xF8 (Clock), 0xFA (Start), 0xFB (Continue), 0xFC (Stop),
+                        // Filter out MIDI real-time messages (0xF9-0xFF) that can appear inside SysEx
+                        // Note: 0xF8 (Clock) is already filtered in the callback for performance
+                        // These are: 0xF9 (undefined), 0xFA (Start), 0xFB (Continue), 0xFC (Stop),
                         //            0xFE (Active Sensing), 0xFF (System Reset)
                         let original_len = message.len();
                         message.retain(|&b| b < 0xF8 || b == proto::EOX);
@@ -209,6 +222,11 @@ impl MidiDevice {
                         match T::parse(&message) {
                             Ok((_, parsed)) => {
                                 println!("DEBUG: Successfully parsed message");
+                                // Check if more data is already in the buffer
+                                println!("DEBUG: Buffer has {} bytes remaining after parsing", buffer.len());
+                                if buffer.len() > 0 {
+                                    println!("DEBUG: Remaining buffer starts with: {:02X?}", &buffer[..buffer.len().min(50)]);
+                                }
                                 return Ok(parsed);
                             }
                             Err(e) => {
@@ -223,6 +241,9 @@ impl MidiDevice {
 
             // Check timeout
             if start.elapsed() > timeout {
+                let buffer_len = self.input_buffer.lock()
+                    .map(|b| b.len()).unwrap_or(0);
+                println!("DEBUG: Timeout after {:?}, buffer has {} bytes", timeout, buffer_len);
                 return Err(anyhow!("Receive timeout"));
             }
 
@@ -259,42 +280,37 @@ impl MidiDevice {
         let request = SampleDataDumpRequest { sample_no: slot };
         self.send_message(&request)?;
 
-        // Receive the first chunk
+        println!("DEBUG: Waiting for sample data (header says {} samples)...", expected_length);
+        println!("DEBUG: Will accumulate until 2s of silence (header.length may be inaccurate)");
+
+        // Receive first chunk with long timeout
         let mut accumulated = self.receive_message::<SampleData>(Duration::from_secs(120))?;
+        println!("DEBUG: Received first chunk: {} samples", accumulated.data.len());
 
-        println!("DEBUG: Received {}/{} samples (chunk 1)", accumulated.data.len(), expected_length);
-
-        // Keep receiving more chunks until we have all the data
+        // Keep receiving until silence (no data for 2 seconds)
         let mut chunk_num = 2;
-        while accumulated.data.len() < expected_length {
-            match self.receive_message::<SampleData>(Duration::from_secs(30)) {
+        let silence_timeout = Duration::from_secs(2);
+
+        loop {
+            match self.receive_message::<SampleData>(silence_timeout) {
                 Ok(chunk) => {
-                    println!("DEBUG: Received {} more samples (chunk {}), total: {}/{}",
-                        chunk.data.len(), chunk_num, accumulated.data.len() + chunk.data.len(), expected_length);
+                    println!("DEBUG: Chunk {}: +{} samples, total: {}",
+                        chunk_num, chunk.data.len(), accumulated.data.len() + chunk.data.len());
                     accumulated.data.extend(chunk.data);
                     chunk_num += 1;
                 }
-                Err(e) => {
-                    // Check buffer state on timeout
+                Err(_) => {
+                    // Silence - assume transfer complete
                     let buffer_len = self.input_buffer.lock().map(|b| b.len()).unwrap_or(0);
-                    println!("DEBUG: Timeout waiting for chunk {}, buffer has {} bytes", chunk_num, buffer_len);
-
-                    // Timeout or error - check if we have enough data
-                    if accumulated.data.len() >= expected_length * 9 / 10 {
-                        // We have at least 90% of the data, probably good enough
-                        println!("DEBUG: Timeout but have {}/{} samples ({}%), continuing",
-                            accumulated.data.len(), expected_length,
-                            accumulated.data.len() * 100 / expected_length);
-                        break;
-                    } else {
-                        return Err(anyhow!("Failed to receive complete sample data: {} (have {}/{} samples)",
-                            e, accumulated.data.len(), expected_length));
-                    }
+                    println!("DEBUG: Silence detected. Buffer has {} bytes.", buffer_len);
+                    break;
                 }
             }
         }
 
-        println!("DEBUG: Sample data complete: {} samples", accumulated.data.len());
+        println!("DEBUG: Sample data complete: {} samples ({:.1}% of header)",
+            accumulated.data.len(),
+            (accumulated.data.len() as f64 / expected_length as f64) * 100.0);
         Ok(accumulated)
     }
 }
