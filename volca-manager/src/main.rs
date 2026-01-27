@@ -1,270 +1,62 @@
 slint::include_modules!();
 
+// Local modules
+mod audio;
 mod midi;
+mod waveform;
 
-use midi::MidiDevice;
-use slint::{Model, VecModel, SharedString};
-use std::rc::Rc;
+// Standard library
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Generate SVG path commands for waveform display (envelope style)
-/// Coordinates normalized to viewbox dimensions: x in [0, width], y in [0, height]
-/// Sample value +1 maps to y=0 (top), -1 maps to y=height (bottom), 0 at center
-/// Creates a filled envelope showing min/max values at each point
-fn generate_waveform_path(samples: &[i16], num_points: usize, width: f64, height: f64) -> String {
-    if samples.is_empty() {
-        let center_y = height / 2.0;
-        return format!("M 0 {} L {} {} L {} {} L 0 {} Z", center_y, width, center_y, width, center_y, center_y);
-    }
+// External crates
+use slint::{Model, SharedString, VecModel};
+use tracing::{debug, error, info, warn};
 
-    let num_points = num_points.max(2);  // Need at least 2 points
+// Local imports
+use audio::{load_wav_file, play_audio_sample, resample_audio, OriginalSample};
+use midi::MidiDevice;
+use waveform::generate_waveform_path;
 
-    // We'll draw the upper envelope forward, then lower envelope backward to create a filled shape
-    let mut upper_points: Vec<(f64, f64)> = Vec::with_capacity(num_points);
-    let mut lower_points: Vec<(f64, f64)> = Vec::with_capacity(num_points);
-
-    for i in 0..num_points {
-        // Map i to sample range
-        let t = i as f64 / (num_points - 1) as f64;  // 0.0 to 1.0
-        let center_idx = (t * (samples.len() - 1) as f64) as usize;
-
-        // Sample a window around this position
-        let window_size = (samples.len() / num_points).max(1);
-        let start_idx = center_idx.saturating_sub(window_size / 2);
-        let end_idx = (start_idx + window_size).min(samples.len());
-
-        // Find min/max sample values in this window
-        let mut min_val: i16 = i16::MAX;
-        let mut max_val: i16 = i16::MIN;
-        for j in start_idx..end_idx {
-            let s = samples[j];
-            min_val = min_val.min(s);
-            max_val = max_val.max(s);
-        }
-
-        // Convert to viewbox coordinates
-        // x: 0 to width (full width)
-        // y: 0 (top, +1.0) to height (bottom, -1.0), center at height/2
-        let x = t * width;
-        let center_y = height / 2.0;
-        let y_range = height * 0.98 / 2.0;  // Use 98% of height for waveform (slight padding)
-        let y_max = center_y - (max_val as f64 / i16::MAX as f64) * y_range;
-        let y_min = center_y - (min_val as f64 / i16::MAX as f64) * y_range;
-
-        upper_points.push((x, y_max));
-        lower_points.push((x, y_min));
-    }
-
-    // Build path: upper envelope forward, then lower envelope backward
-    let mut path = String::with_capacity(num_points * 40);
-
-    // Start at x=0 with first point
-    path.push_str(&format!("M 0 {:.1}", upper_points.first().map(|p| p.1).unwrap_or(500.0)));
-
-    // Draw upper envelope
-    for &(x, y) in upper_points.iter() {
-        path.push_str(&format!(" L {:.1} {:.1}", x, y));
-    }
-
-    // Ensure we reach x=width
-    if let Some(&(_, y)) = upper_points.last() {
-        path.push_str(&format!(" L {:.1} {:.1}", width, y));
-    }
-
-    // Draw lower envelope in reverse
-    if let Some(&(_, y)) = lower_points.last() {
-        path.push_str(&format!(" L {:.1} {:.1}", width, y));
-    }
-    for &(x, y) in lower_points.iter().rev() {
-        path.push_str(&format!(" L {:.1} {:.1}", x, y));
-    }
-
-    // Close back to start
-    path.push_str(&format!(" L 0 {:.1}", lower_points.first().map(|p| p.1).unwrap_or(500.0)));
-    path.push_str(" Z");
-
-    path
-}
-
-/// Load WAV file and store at original sample rate
-/// Returns (original_sample_rate, samples_at_original_rate, speed_for_original_rate)
-fn load_wav_file(path: &std::path::Path) -> Result<(u32, Vec<i16>, u16), String> {
-    use volsa2_core::audio::VOLCA_SAMPLERATE;
-    use hound::SampleFormat;
-
-    // Open WAV file
-    let mut wav_reader = hound::WavReader::open(path)
-        .map_err(|e| format!("Failed to open WAV: {}", e))?;
-    let spec = wav_reader.spec();
-    let original_sample_rate = spec.sample_rate;
-    let channels = spec.channels;
-
-    // Read samples based on format and convert to mono i16 at original rate
-    let samples: Vec<i16> = match (spec.sample_format, spec.bits_per_sample, channels) {
-        // 16-bit int mono
-        (SampleFormat::Int, 16, 1) => {
-            wav_reader.samples::<i16>()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to read samples: {}", e))?
-        },
-        // 16-bit int stereo - mix to mono
-        (SampleFormat::Int, 16, 2) => {
-            let all_samples: Vec<i16> = wav_reader.samples::<i16>()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to read samples: {}", e))?;
-            all_samples.chunks_exact(2)
-                .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
-                .collect()
-        },
-        // 32-bit float - convert to i16
-        (SampleFormat::Float, 32, 1) => {
-            wav_reader.samples::<f32>()
-                .map(|s| s.map(|f| (f * i16::MAX as f32).round() as i16))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to read samples: {}", e))?
-        },
-        // 32-bit float stereo - mix to mono
-        (SampleFormat::Float, 32, 2) => {
-            let all_samples: Vec<f32> = wav_reader.samples::<f32>()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to read samples: {}", e))?;
-            all_samples.chunks_exact(2)
-                .map(|chunk| (((chunk[0] + chunk[1]) / 2.0) * i16::MAX as f32).round() as i16)
-                .collect()
-        },
-        // Unsupported format
-        _ => {
-            return Err(format!("Unsupported WAV format: {} bit {:?}, {} channels",
-                             spec.bits_per_sample, spec.sample_format, channels));
-        }
-    };
-
-    // Calculate speed for original rate
-    let speed = if original_sample_rate > VOLCA_SAMPLERATE {
-        16384  // Will resample to 31.25kHz, play at 1x
-    } else {
-        ((original_sample_rate as f32 / VOLCA_SAMPLERATE as f32) * 16384.0) as u16
-    };
-
-    Ok((original_sample_rate, samples, speed))
-}
-
-/// Resample audio from source rate to target rate
-fn resample_audio(samples: &[i16], from_rate: u32, to_rate: u32) -> Result<Vec<i16>, String> {
-    use rubato::{FftFixedIn, Resampler};
-
-    if from_rate == to_rate {
-        return Ok(samples.to_vec());
-    }
-
-    // Convert i16 samples to f64 for rubato
-    let samples_f64: Vec<f64> = samples.iter()
-        .map(|&s| s as f64 / i16::MAX as f64)
-        .collect();
-
-    // Create resampler
-    let mut resampler = FftFixedIn::new(
-        from_rate as usize,
-        to_rate as usize,
-        samples.len(),
-        samples.len(),
-        1,  // mono
-    ).map_err(|e| format!("Failed to create resampler: {}", e))?;
-
-    // Resample
-    let result = resampler.process(&[samples_f64], None)
-        .map_err(|e| format!("Resampling failed: {}", e))?
-        .pop()
-        .unwrap();
-
-    // Convert back to i16
-    Ok(result.into_iter()
-        .map(|s| (s * i16::MAX as f64).round() as i16)
-        .collect())
-}
-
-/// Stores original sample data for lossless resampling
-#[derive(Clone)]
-pub struct OriginalSample {
-    samples: Vec<i16>,           // Original samples at original sample rate
-    original_sample_rate: u32,   // Original sample rate (e.g., 44100, 16000)
-    current_speed: u16,          // Current playback speed (for display rate)
-}
-
-impl OriginalSample {
-    /// Get current effective sample rate in Hz
-    fn current_sample_rate(&self) -> f32 {
-        31250.0 * self.current_speed as f32 / 16384.0
-    }
-
-    /// Resample to target rate, returning (resampled_samples, new_speed)
-    fn resample_to(&self, target_rate: u32) -> Result<(Vec<i16>, u16), String> {
-        use volsa2_core::audio::VOLCA_SAMPLERATE;
-
-        // Calculate speed parameter for target rate
-        let speed = ((target_rate as f32 / VOLCA_SAMPLERATE as f32) * 16384.0) as u16;
-
-        // If target rate == original rate, no resampling needed
-        if target_rate == self.original_sample_rate {
-            return Ok((self.samples.clone(), speed));
-        }
-
-        // Resample from original to target rate
-        // Note: We resample to 31.25kHz but adjust speed for effective playback rate
-        let resampled = resample_audio(&self.samples, self.original_sample_rate, VOLCA_SAMPLERATE)
-            .map_err(|e| format!("Resample failed: {}", e))?;
-
-        Ok((resampled, speed))
-    }
-}
+// Constants
+const TOTAL_SLOTS: usize = 200;
+const MAX_NAME_LENGTH: usize = 24;
+const WAVEFORM_POINTS: usize = 1000;
+const VOLCA_SAMPLE_RATE: u32 = 31250;
 
 pub struct AppState {
     pub samples: Rc<VecModel<SampleInfo>>,
     pub connected: bool,
-    pub device: Arc<Mutex<Option<MidiDevice>>>,  // Arc for thread-safety
+    pub device: Arc<Mutex<Option<MidiDevice>>>,
     pub firmware_version: String,
     pub logs: Rc<VecModel<SharedString>>,
     pub ui: slint::Weak<AppWindow>,
-    pub downloaded_samples: Arc<Mutex<HashMap<u8, OriginalSample>>>,  // Arc for thread-safety
-    pub stop_sender: Arc<Mutex<Option<Sender<()>>>>,  // Arc for thread-safety
-    pub is_playing: Arc<AtomicBool>,  // Thread-safe playback state
-    pub playback_info: Arc<Mutex<Option<(Instant, f64)>>>,  // (start_time, duration_secs)
+    pub downloaded_samples: Arc<Mutex<HashMap<u8, OriginalSample>>>,
+    pub stop_sender: Arc<Mutex<Option<Sender<()>>>>,
+    pub is_playing: Arc<AtomicBool>,
+    pub playback_info: Arc<Mutex<Option<(Instant, f64)>>>,
 }
 
 impl AppState {
-    const MAX_LOGS: usize = 100; // Keep last 100 messages
-
     pub fn log(&self, message: String) {
         let timestamp = chrono::Local::now().format("%H:%M:%S");
         let log_msg = format!("[{}] {}", timestamp, message);
 
-        // Add to logs
-        self.logs.push(SharedString::from(log_msg));
-
-        // Trim if too many
-        if self.logs.row_count() > Self::MAX_LOGS {
-            let to_remove = self.logs.row_count() - Self::MAX_LOGS;
-            for _ in 0..to_remove {
-                // Remove from beginning (oldest)
-                // Note: VecModel doesn't have remove_front, so we'll just let it grow for now
-            }
-        }
+        self.logs.push(SharedString::from(log_msg.clone()));
 
         // Update UI with joined text
         self.update_log_text_ui();
 
-        // Also print to console
-        println!("{}", message);
+        // Also log via tracing
+        info!("{}", message);
     }
 
     fn update_log_text_ui(&self) {
         if let Some(ui) = self.ui.upgrade() {
-            // Join all logs with newlines
             let log_text: String = (0..self.logs.row_count())
                 .filter_map(|i| self.logs.row_data(i))
                 .map(|s| s.to_string())
@@ -278,10 +70,10 @@ impl AppState {
     pub fn new(ui: slint::Weak<AppWindow>) -> Self {
         let samples = Rc::new(VecModel::default());
 
-        // Initialize with 200 empty slots
-        for i in 0..200 {
+        // Initialize with empty slots
+        for i in 0..TOTAL_SLOTS {
             samples.push(SampleInfo {
-                slot: i,
+                slot: i as i32,
                 name: SharedString::from(""),
                 length: 0,
                 speed: 0,
@@ -304,9 +96,9 @@ impl AppState {
         }
     }
 
-    /// Scan all 200 sample slots from the device
+    /// Scan all sample slots from the device
     pub fn scan_all_samples(&self) {
-        self.log("Starting scan of all 200 sample slots...".to_string());
+        self.log("Starting scan of all sample slots...".to_string());
 
         if let Some(ui) = self.ui.upgrade() {
             ui.set_scanning(true);
@@ -316,10 +108,14 @@ impl AppState {
         if let Some(device) = device_opt.as_mut() {
             let mut samples_found = 0;
 
-            for slot in 0..200 {
+            for slot in 0..TOTAL_SLOTS {
                 // Log progress every 20 slots
                 if slot % 20 == 0 {
-                    self.log(format!("Scanning slots {}-{}...", slot, (slot + 19).min(199)));
+                    self.log(format!(
+                        "Scanning slots {}-{}...",
+                        slot,
+                        (slot + 19).min(TOTAL_SLOTS - 1)
+                    ));
                 }
 
                 match device.get_sample_info(slot as u8) {
@@ -329,14 +125,21 @@ impl AppState {
                             samples_found += 1;
                         }
 
-                        self.samples.set_row_data(slot as usize, SampleInfo {
-                            slot: slot as i32,
-                            name: SharedString::from(if has_sample { header.name.as_str() } else { "(empty)" }),
-                            length: header.length as i32,
-                            speed: header.speed as i32,
-                            has_sample,
-                            name_edited: false,
-                        });
+                        self.samples.set_row_data(
+                            slot,
+                            SampleInfo {
+                                slot: slot as i32,
+                                name: SharedString::from(if has_sample {
+                                    header.name.as_str()
+                                } else {
+                                    "(empty)"
+                                }),
+                                length: header.length as i32,
+                                speed: header.speed as i32,
+                                has_sample,
+                                name_edited: false,
+                            },
+                        );
 
                         // Update UI periodically
                         if let Some(ui) = self.ui.upgrade() {
@@ -344,21 +147,26 @@ impl AppState {
                         }
                     }
                     Err(e) => {
-                        self.log(format!("Error reading slot {}: {}", slot, e));
-                        // Set as empty on error
-                        self.samples.set_row_data(slot as usize, SampleInfo {
-                            slot: slot as i32,
-                            name: SharedString::from("(error)"),
-                            length: 0,
-                            speed: 0,
-                            has_sample: false,
-                            name_edited: false,
-                        });
+                        warn!("Error reading slot {}: {}", slot, e);
+                        self.samples.set_row_data(
+                            slot,
+                            SampleInfo {
+                                slot: slot as i32,
+                                name: SharedString::from("(error)"),
+                                length: 0,
+                                speed: 0,
+                                has_sample: false,
+                                name_edited: false,
+                            },
+                        );
                     }
                 }
             }
 
-            self.log(format!("Scan complete! Found {} samples in 200 slots.", samples_found));
+            self.log(format!(
+                "Scan complete! Found {} samples in {} slots.",
+                samples_found, TOTAL_SLOTS
+            ));
         } else {
             self.log("Error: No device connected".to_string());
         }
@@ -369,7 +177,7 @@ impl AppState {
     }
 
     pub fn update_sample(&mut self, slot: i32, info: SampleInfo) {
-        if slot >= 0 && slot < 200 {
+        if slot >= 0 && (slot as usize) < TOTAL_SLOTS {
             self.samples.set_row_data(slot as usize, info);
         }
     }
@@ -400,71 +208,15 @@ impl Clone for AppState {
     }
 }
 
-/// Play audio samples using rodio with speed-adjusted sample rate
-/// Returns true if playback completed, false if stopped early
-fn play_audio_sample(samples: &[i16], speed: u16, stop_receiver: mpsc::Receiver<()>) -> bool {
-    use rodio::{OutputStream, Sink};
-    use rodio::buffer::SamplesBuffer;
-    use std::time::Duration;
-
-    println!("DEBUG: play_audio_sample called with {} samples, speed {}", samples.len(), speed);
-
-    // Create output stream
-    let (_stream, stream_handle) = match OutputStream::try_default() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to create audio output: {}", e);
-            return false;
+/// Helper to clear loading slot indicator from any thread
+fn clear_loading_slot(ui_weak: &slint::Weak<AppWindow>) {
+    let ui_weak_clone = ui_weak.clone();
+    slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak_clone.upgrade() {
+            ui.set_loading_slot(-1);
         }
-    };
-    let sink = match Sink::try_new(&stream_handle) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to create audio sink: {}", e);
-            return false;
-        }
-    };
-
-    // Volca Sample 2 base specs: 31,250 Hz, mono, 16-bit
-    // Speed is a fixed-point value where 16384 = 1.0x
-    const BASE_RATE: u32 = 31250;
-    const DEFAULT_SPEED: u16 = 16384;
-    const CHANNELS: u16 = 1;
-
-    // Calculate effective sample rate based on speed metadata
-    let sample_rate = (BASE_RATE as f64 * (speed as f64 / DEFAULT_SPEED as f64)) as u32;
-
-    println!("DEBUG: Creating SamplesBuffer with {} samples at {} Hz (speed {})", samples.len(), sample_rate, speed);
-
-    // Create audio buffer from i16 samples
-    let buffer = SamplesBuffer::new(CHANNELS, sample_rate, samples.to_vec());
-
-    // Add to sink and play
-    sink.append(buffer);
-    println!("DEBUG: Starting playback...");
-
-    // Poll for completion or stop signal
-    loop {
-        // Check if playback finished
-        if sink.empty() {
-            println!("DEBUG: Playback complete");
-            return true;
-        }
-
-        // Check for stop signal (non-blocking)
-        match stop_receiver.try_recv() {
-            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
-                println!("DEBUG: Stop signal received");
-                sink.stop();
-                return false;
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                // Continue playing
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    })
+    .ok();
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -509,7 +261,10 @@ fn main() -> Result<(), slint::PlatformError> {
             app_state.scan_all_samples();
         }
         Err(e) => {
-            app_state.log(format!("Auto-connect failed: {}. Click Connect to retry.", e));
+            app_state.log(format!(
+                "Auto-connect failed: {}. Click Connect to retry.",
+                e
+            ));
             ui.set_connected(false);
         }
     }
@@ -521,14 +276,13 @@ fn main() -> Result<(), slint::PlatformError> {
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(50),  // 50ms for smoother playhead movement
+        std::time::Duration::from_millis(50),
         move || {
             if let Some(ui) = ui_weak_timer.upgrade() {
                 let playing = is_playing_timer.load(Ordering::SeqCst);
                 if ui.get_is_playing() != playing {
                     ui.set_is_playing(playing);
                     if !playing {
-                        // Reset position when playback stops
                         ui.set_playback_position(0.0);
                     }
                 }
@@ -555,31 +309,33 @@ fn update_ui_after_download(
     slot: i32,
     waveform_data: Vec<i16>,
     header_speed: u16,
-    update_sample_info: Option<(String, u32)>,  // (name, length) - if provided, updates SampleInfo
+    update_sample_info: Option<(String, u32)>,
 ) {
     let ui_weak_clone = ui_weak.clone();
     slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_weak_clone.upgrade() {
-            // Optionally update SampleInfo with fresh data from device (clears any unsaved edits)
+            // Optionally update SampleInfo with fresh data from device
             if let Some((name, length)) = update_sample_info {
                 ui.invoke_update_sample_from_device(
                     slot,
                     SharedString::from(name),
                     length as i32,
-                    header_speed as i32
+                    header_speed as i32,
                 );
             }
 
             // Generate and display waveform
             let width = ui.get_waveform_display_width();
             let height = ui.get_waveform_display_height();
-            let waveform_path = generate_waveform_path(&waveform_data, 1000, width as f64, height as f64);
+            let waveform_path =
+                generate_waveform_path(&waveform_data, WAVEFORM_POINTS, width as f64, height as f64);
             ui.set_waveform_path(SharedString::from(waveform_path));
 
             // Clear loading state
             ui.set_loading_slot(-1);
         }
-    }).ok();
+    })
+    .ok();
 }
 
 fn setup_callbacks(ui: &AppWindow, state: AppState) {
@@ -593,13 +349,11 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         let is_connected = ui.get_connected();
 
         if is_connected {
-            // Disconnect
             state_connect.log("Disconnecting from device...".to_string());
             *state_connect.device.lock().unwrap() = None;
             ui.set_connected(false);
             state_connect.log("Disconnected.".to_string());
         } else {
-            // Connect
             state_connect.log("Attempting to connect to Volca Sample 2...".to_string());
             match MidiDevice::connect() {
                 Ok(device) => {
@@ -607,8 +361,6 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                     *state_connect.device.lock().unwrap() = Some(device);
                     ui.set_connected(true);
                     state_connect.log(format!("Successfully connected! Firmware: {}", firmware));
-
-                    // Auto-scan on connect
                     state_connect.scan_all_samples();
                 }
                 Err(e) => {
@@ -627,11 +379,9 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
     });
 
     // Upload callback
-    let ui_weak_upload = ui_weak.clone();
     let state_upload = state.clone();
     ui.on_upload_clicked(move |slot| {
         state_upload.log(format!("Upload to slot {} clicked", slot));
-        let _ui = ui_weak_upload.unwrap();
         // TODO: Implement upload
     });
 
@@ -639,7 +389,6 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
     let state_download = state.clone();
     let ui_weak_download = ui_weak.clone();
     ui.on_download_clicked(move |slot| {
-        // Check if sample exists in UI state
         let sample = match state_download.get_sample(slot) {
             Some(s) if s.has_sample => s,
             _ => {
@@ -659,87 +408,66 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         ui.set_is_playing(false);
         ui.set_playback_position(0.0);
 
-        // Set loading state BEFORE starting download
         ui.set_loading_slot(slot);
         state_download.log(format!("Refreshing slot {}: {}...", slot, sample.name));
 
-        // Spawn background thread for download
         let device_ref = state_download.device.clone();
         let downloaded_ref = state_download.downloaded_samples.clone();
         let ui_weak = state_download.ui.clone();
 
         std::thread::spawn(move || {
-            use std::time::Instant;
             let start_time = Instant::now();
-
-            // Get device and download the sample
             let mut device_guard = device_ref.lock().unwrap();
-            if let Some(device) = device_guard.as_mut() {
-                // Fetch sample header and data
-                match device.get_sample_info(slot as u8) {
-                    Ok(header) => {
-                        match device.get_sample_data(slot as u8, header.length as usize) {
-                            Ok(sample_data) => {
-                                let elapsed = start_time.elapsed();
 
-                                // Store in memory as OriginalSample
-                                let audio_data_clone = sample_data.data.clone();
-                                downloaded_ref.lock().unwrap().insert(
-                                    slot as u8,
-                                    OriginalSample {
-                                        samples: audio_data_clone.clone(),
-                                        original_sample_rate: 31250,  // Device samples are always 31.25kHz
-                                        current_speed: header.speed,
-                                    }
-                                );
+            let Some(device) = device_guard.as_mut() else {
+                error!("Device not connected");
+                clear_loading_slot(&ui_weak);
+                return;
+            };
 
-                                println!("✓ Refreshed in {:.3}s", elapsed.as_secs_f64());
-
-                                // Update UI with fresh sample info from device (clears any unsaved edits)
-                                update_ui_after_download(
-                                    &ui_weak,
-                                    slot,
-                                    audio_data_clone,
-                                    header.speed,
-                                    Some((header.name.clone(), header.length))
-                                );
-                            }
-                            Err(e) => {
-                                let error_msg = format!("✗ Refresh failed: {}", e);
-                                println!("{}", error_msg);
-                                let ui_weak_clone = ui_weak.clone();
-                                slint::invoke_from_event_loop(move || {
-                                    if let Some(ui) = ui_weak_clone.upgrade() {
-                                        ui.set_loading_slot(-1);
-                                    }
-                                }).ok();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = format!("✗ Failed to get sample info: {}", e);
-                        println!("{}", error_msg);
-                        let ui_weak_clone = ui_weak.clone();
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_weak_clone.upgrade() {
-                                ui.set_loading_slot(-1);
-                            }
-                        }).ok();
-                    }
+            let header = match device.get_sample_info(slot as u8) {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("Failed to get sample info: {}", e);
+                    clear_loading_slot(&ui_weak);
+                    return;
                 }
-            } else {
-                println!("ERROR: Device not connected");
-                let ui_weak_clone = ui_weak.clone();
-                slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak_clone.upgrade() {
-                        ui.set_loading_slot(-1);
-                    }
-                }).ok();
-            }
+            };
+
+            let sample_data = match device.get_sample_data(slot as u8) {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("Refresh failed: {}", e);
+                    clear_loading_slot(&ui_weak);
+                    return;
+                }
+            };
+
+            let elapsed = start_time.elapsed();
+            let audio_data_clone = sample_data.data.clone();
+
+            downloaded_ref.lock().unwrap().insert(
+                slot as u8,
+                OriginalSample {
+                    samples: audio_data_clone.clone(),
+                    original_sample_rate: VOLCA_SAMPLE_RATE,
+                    current_speed: header.speed,
+                },
+            );
+
+            debug!("Refreshed in {:.3}s", elapsed.as_secs_f64());
+
+            update_ui_after_download(
+                &ui_weak,
+                slot,
+                audio_data_clone,
+                header.speed,
+                Some((header.name.clone(), header.length)),
+            );
         });
     });
 
-    // Play callback - plays the currently selected sample
+    // Play callback
     let state_play = state.clone();
     let ui_weak_play = ui_weak.clone();
     ui.on_play_clicked(move || {
@@ -751,42 +479,47 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
             return;
         }
 
-        if let Some(sample) = state_play.get_sample(slot) {
-            if sample.has_sample {
-                // Check if we have the sample data in memory - clone immediately to avoid holding lock
-                let maybe_audio_data = state_play.downloaded_samples.lock().unwrap()
-                    .get(&(slot as u8))
-                    .map(|orig| (orig.samples.clone(), orig.current_speed));
-                if let Some((audio_data, speed)) = maybe_audio_data {
-                    let sample_count = audio_data.len();
-                    let effective_rate = (31250.0 * (speed as f64 / 16384.0)) as u32;
-                    let duration_secs = sample_count as f64 / effective_rate as f64;
-                    state_play.log(format!("Playing {} ({:.1}s)", sample.name, duration_secs));
+        let Some(sample) = state_play.get_sample(slot) else {
+            return;
+        };
 
-                    // Create stop channel
-                    let (tx, rx) = mpsc::channel();
-                    *state_play.stop_sender.lock().unwrap() = Some(tx);
-
-                    // Set playing state and store playback info for position tracking
-                    state_play.is_playing.store(true, Ordering::SeqCst);
-                    *state_play.playback_info.lock().unwrap() = Some((Instant::now(), duration_secs));
-                    ui.set_is_playing(true);
-                    ui.set_playback_position(0.0);
-
-                    // Play the audio in a background thread
-                    let is_playing_flag = state_play.is_playing.clone();
-                    let playback_info_flag = state_play.playback_info.clone();
-                    std::thread::spawn(move || {
-                        let completed = play_audio_sample(&audio_data, speed, rx);
-                        println!("Playback {}", if completed { "complete" } else { "stopped" });
-                        is_playing_flag.store(false, Ordering::SeqCst);
-                        *playback_info_flag.lock().unwrap() = None;
-                    });
-                } else {
-                    state_play.log(format!("Sample not downloaded yet. Click 💾 to download first."));
-                }
-            }
+        if !sample.has_sample {
+            return;
         }
+
+        let maybe_audio_data = state_play
+            .downloaded_samples
+            .lock()
+            .unwrap()
+            .get(&(slot as u8))
+            .map(|orig| (orig.samples.clone(), orig.current_speed));
+
+        let Some((audio_data, speed)) = maybe_audio_data else {
+            state_play.log("Sample not downloaded yet. Click the refresh button first.".to_string());
+            return;
+        };
+
+        let sample_count = audio_data.len();
+        let effective_rate = (31250.0 * (speed as f64 / 16384.0)) as u32;
+        let duration_secs = sample_count as f64 / effective_rate as f64;
+        state_play.log(format!("Playing {} ({:.1}s)", sample.name, duration_secs));
+
+        let (tx, rx) = mpsc::channel();
+        *state_play.stop_sender.lock().unwrap() = Some(tx);
+
+        state_play.is_playing.store(true, Ordering::SeqCst);
+        *state_play.playback_info.lock().unwrap() = Some((Instant::now(), duration_secs));
+        ui.set_is_playing(true);
+        ui.set_playback_position(0.0);
+
+        let is_playing_flag = state_play.is_playing.clone();
+        let playback_info_flag = state_play.playback_info.clone();
+        std::thread::spawn(move || {
+            let completed = play_audio_sample(&audio_data, speed, rx);
+            debug!("Playback {}", if completed { "complete" } else { "stopped" });
+            is_playing_flag.store(false, Ordering::SeqCst);
+            *playback_info_flag.lock().unwrap() = None;
+        });
     });
 
     // Stop callback
@@ -829,143 +562,125 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         }
     });
 
-    // Debug log toggle callback (Cmd+D)
+    // Debug log toggle callback
     let ui_weak_toggle = ui_weak.clone();
     ui.on_toggle_debug_log(move || {
-        println!("DEBUG: toggle_debug_log callback triggered!");
         let ui = ui_weak_toggle.unwrap();
         let current = ui.get_show_debug_log();
-        println!("DEBUG: current show_debug_log = {}, setting to {}", current, !current);
+        debug!("Toggling debug log: {} -> {}", current, !current);
         ui.set_show_debug_log(!current);
     });
 
-    // Pad selection callback - select a sample to view its waveform
+    // Pad selection callback
     let state_select = state.clone();
     ui.on_pad_selected(move |slot| {
-        println!("Pad selected: slot {}", slot);
+        debug!("Pad selected: slot {}", slot);
         let ui = state_select.ui.upgrade().unwrap();
         ui.set_selected_slot(slot);
 
-        // Get sample info for the selected slot
-        if let Some(sample) = state_select.get_sample(slot) {
-            // Do nothing if the slot is empty
-            if !sample.has_sample {
-                return;
-            }
+        let Some(sample) = state_select.get_sample(slot) else {
+            return;
+        };
 
-            ui.set_selected_sample_name(sample.name.clone());
-            ui.set_selected_sample_length(sample.length as i32);
-
-            // Stop any active playback when switching samples
-            if let Some(sender) = state_select.stop_sender.lock().unwrap().take() {
-                let _ = sender.send(());
-            }
-            state_select.is_playing.store(false, Ordering::SeqCst);
-            *state_select.playback_info.lock().unwrap() = None;
-            ui.set_is_playing(false);
-            ui.set_playback_position(0.0);
-
-            // Check if we have downloaded audio data for this slot
-            // Clone the data immediately to avoid holding the lock
-            let maybe_sample_data = state_select.downloaded_samples.lock().unwrap()
-                .get(&(slot as u8))
-                .map(|orig| orig.samples.clone());
-            if let Some(audio_data) = maybe_sample_data {
-                    state_select.log(format!("Selected slot {}: {} ({} samples)", slot, sample.name, audio_data.len()));
-
-                    // Generate SVG path for waveform using current display dimensions
-                    let width = ui.get_waveform_display_width();
-                    let height = ui.get_waveform_display_height();
-                    let waveform_path = generate_waveform_path(&audio_data, 1000, width as f64, height as f64);
-                    ui.set_waveform_path(SharedString::from(waveform_path));
-                } else {
-                    // Sample not downloaded yet - download it automatically
-                    state_select.log(format!("Selected slot {}: {} (downloading...)", slot, sample.name));
-                    ui.set_waveform_path(SharedString::from(""));
-
-                    // Set loading state for this slot BEFORE starting download
-                    ui.set_loading_slot(slot);
-
-                    // Spawn background thread for download to keep UI responsive
-                    let device_ref = state_select.device.clone();
-                    let downloaded_ref = state_select.downloaded_samples.clone();
-                    let ui_weak = state_select.ui.clone();
-
-                    std::thread::spawn(move || {
-                        use std::time::Instant;
-                        let start_time = Instant::now();
-
-                        // Get device and download the sample
-                        let mut device_guard = device_ref.lock().unwrap();
-                        if let Some(device) = device_guard.as_mut() {
-                            // Fetch sample header and data
-                            match device.get_sample_info(slot as u8) {
-                                Ok(header) => {
-                                    match device.get_sample_data(slot as u8, header.length as usize) {
-                                        Ok(sample_data) => {
-                                            let elapsed = start_time.elapsed();
-
-                                            // Store in memory as OriginalSample
-                                            let audio_data_clone = sample_data.data.clone();
-                                            downloaded_ref.lock().unwrap().insert(
-                                                slot as u8,
-                                                OriginalSample {
-                                                    samples: audio_data_clone.clone(),
-                                                    original_sample_rate: 31250,  // Device samples are always 31.25kHz
-                                                    current_speed: header.speed,
-                                                }
-                                            );
-
-                                            println!("✓ Downloaded in {:.3}s", elapsed.as_secs_f64());
-
-                                            // Update UI (don't update SampleInfo - keep existing data)
-                                            update_ui_after_download(
-                                                &ui_weak,
-                                                slot,
-                                                audio_data_clone,
-                                                header.speed,
-                                                None  // Don't update SampleInfo, just waveform
-                                            );
-                                        }
-                                        Err(e) => {
-                                            let error_msg = format!("✗ Download failed: {}", e);
-                                            println!("{}", error_msg);
-                                            let ui_weak_clone = ui_weak.clone();
-                                            slint::invoke_from_event_loop(move || {
-                                                if let Some(ui) = ui_weak_clone.upgrade() {
-                                                    ui.set_loading_slot(-1);
-                                                }
-                                            }).ok();
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    let error_msg = format!("✗ Failed to get sample info: {}", e);
-                                    println!("{}", error_msg);
-                                    let ui_weak_clone = ui_weak.clone();
-                                    slint::invoke_from_event_loop(move || {
-                                        if let Some(ui) = ui_weak_clone.upgrade() {
-                                            ui.set_loading_slot(-1);
-                                        }
-                                    }).ok();
-                                }
-                            }
-                        } else {
-                            println!("ERROR: Device not connected");
-                            let ui_weak_clone = ui_weak.clone();
-                            slint::invoke_from_event_loop(move || {
-                                if let Some(ui) = ui_weak_clone.upgrade() {
-                                    ui.set_loading_slot(-1);
-                                }
-                            }).ok();
-                        }
-                    });
-                }
-
-            // Reset zoom and scroll when selecting a new sample
-            ui.set_waveform_zoom(1.0);
-            ui.set_waveform_scroll(0.0);
+        if !sample.has_sample {
+            return;
         }
+
+        ui.set_selected_sample_name(sample.name.clone());
+        ui.set_selected_sample_length(sample.length);
+
+        // Stop any active playback when switching samples
+        if let Some(sender) = state_select.stop_sender.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        state_select.is_playing.store(false, Ordering::SeqCst);
+        *state_select.playback_info.lock().unwrap() = None;
+        ui.set_is_playing(false);
+        ui.set_playback_position(0.0);
+
+        // Check if we have downloaded audio data for this slot
+        let maybe_sample_data = state_select
+            .downloaded_samples
+            .lock()
+            .unwrap()
+            .get(&(slot as u8))
+            .map(|orig| orig.samples.clone());
+
+        if let Some(audio_data) = maybe_sample_data {
+            state_select.log(format!(
+                "Selected slot {}: {} ({} samples)",
+                slot,
+                sample.name,
+                audio_data.len()
+            ));
+
+            let width = ui.get_waveform_display_width();
+            let height = ui.get_waveform_display_height();
+            let waveform_path =
+                generate_waveform_path(&audio_data, WAVEFORM_POINTS, width as f64, height as f64);
+            ui.set_waveform_path(SharedString::from(waveform_path));
+        } else {
+            // Sample not downloaded yet - download it automatically
+            state_select.log(format!(
+                "Selected slot {}: {} (downloading...)",
+                slot, sample.name
+            ));
+            ui.set_waveform_path(SharedString::from(""));
+            ui.set_loading_slot(slot);
+
+            let device_ref = state_select.device.clone();
+            let downloaded_ref = state_select.downloaded_samples.clone();
+            let ui_weak = state_select.ui.clone();
+
+            std::thread::spawn(move || {
+                let start_time = Instant::now();
+                let mut device_guard = device_ref.lock().unwrap();
+
+                let Some(device) = device_guard.as_mut() else {
+                    error!("Device not connected");
+                    clear_loading_slot(&ui_weak);
+                    return;
+                };
+
+                let header = match device.get_sample_info(slot as u8) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!("Failed to get sample info: {}", e);
+                        clear_loading_slot(&ui_weak);
+                        return;
+                    }
+                };
+
+                let sample_data = match device.get_sample_data(slot as u8) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        error!("Download failed: {}", e);
+                        clear_loading_slot(&ui_weak);
+                        return;
+                    }
+                };
+
+                let elapsed = start_time.elapsed();
+                let audio_data_clone = sample_data.data.clone();
+
+                downloaded_ref.lock().unwrap().insert(
+                    slot as u8,
+                    OriginalSample {
+                        samples: audio_data_clone.clone(),
+                        original_sample_rate: VOLCA_SAMPLE_RATE,
+                        current_speed: header.speed,
+                    },
+                );
+
+                debug!("Downloaded in {:.3}s", elapsed.as_secs_f64());
+
+                update_ui_after_download(&ui_weak, slot, audio_data_clone, header.speed, None);
+            });
+        }
+
+        // Reset zoom and scroll when selecting a new sample
+        ui.set_waveform_zoom(1.0);
+        ui.set_waveform_scroll(0.0);
     });
 
     // Regenerate waveform when display size changes
@@ -974,100 +689,114 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         let ui = state_regen.ui.upgrade().unwrap();
         let slot = ui.get_selected_slot();
 
-        // Only regenerate if we have a sample selected
-        if let Some(sample) = state_regen.get_sample(slot) {
-            if sample.has_sample {
-                // Clone the data immediately to avoid holding the lock
-                let maybe_audio_data = state_regen.downloaded_samples.lock().unwrap()
-                    .get(&(slot as u8))
-                    .map(|orig| (orig.samples.clone(), orig.current_speed));
-                if let Some((audio_data, _speed)) = maybe_audio_data {
-                    // Regenerate waveform with new dimensions
-                    let waveform_path = generate_waveform_path(&audio_data, 1000, width as f64, height as f64);
-                    ui.set_waveform_path(SharedString::from(waveform_path));
-                }
-            }
+        let Some(sample) = state_regen.get_sample(slot) else {
+            return;
+        };
+
+        if !sample.has_sample {
+            return;
+        }
+
+        let maybe_audio_data = state_regen
+            .downloaded_samples
+            .lock()
+            .unwrap()
+            .get(&(slot as u8))
+            .map(|orig| orig.samples.clone());
+
+        if let Some(audio_data) = maybe_audio_data {
+            let waveform_path =
+                generate_waveform_path(&audio_data, WAVEFORM_POINTS, width as f64, height as f64);
+            ui.set_waveform_path(SharedString::from(waveform_path));
         }
     });
 
-    // Load WAV callback - replace sample audio without writing to device
+    // Load WAV callback
     let state_load_wav = state.clone();
     let ui_weak_load_wav = ui_weak.clone();
     ui.on_load_wav_clicked(move || {
         let ui = ui_weak_load_wav.unwrap();
         let slot = ui.get_selected_slot();
 
-        if slot < 0 || slot >= 200 {
-            println!("No slot selected for WAV load");
+        if slot < 0 || slot >= TOTAL_SLOTS as i32 {
+            warn!("No slot selected for WAV load");
             return;
         }
 
-        // Open file dialog (rfd already in Cargo.toml)
         let file = rfd::FileDialog::new()
             .add_filter("WAV Audio", &["wav", "WAV"])
             .set_title("Select WAV file to load")
             .pick_file();
 
         let Some(path) = file else {
-            println!("No file selected");
+            debug!("No file selected");
             return;
         };
 
-        println!("Loading WAV: {:?}", path);
+        debug!("Loading WAV: {:?}", path);
 
-        // Load and process WAV file
         match load_wav_file(&path) {
             Ok((original_sample_rate, samples, speed)) => {
                 let original_sample_count = samples.len();
                 let duration_secs = original_sample_count as f32 / original_sample_rate as f32;
                 let display_rate_khz = 31.25 * speed as f32 / 16384.0;
 
-                println!("Loaded {} samples ({:.2}s) at {} Hz (effective {:.2} kHz)",
-                         original_sample_count, duration_secs, original_sample_rate, display_rate_khz);
+                debug!(
+                    "Loaded {} samples ({:.2}s) at {} Hz (effective {:.2} kHz)",
+                    original_sample_count, duration_secs, original_sample_rate, display_rate_khz
+                );
 
                 // Extract filename for display
-                let filename = path.file_stem()
+                let filename = path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("Untitled")
                     .to_string();
 
-                // Truncate to 24 chars (Volca limit)
-                let name = if filename.len() > 24 {
-                    filename.chars().take(24).collect()
+                // Truncate to max name length
+                let name = if filename.len() > MAX_NAME_LENGTH {
+                    filename.chars().take(MAX_NAME_LENGTH).collect()
                 } else {
                     filename
                 };
 
-                // Resample to 31.25kHz for waveform display and playback
-                match resample_audio(&samples, original_sample_rate, 31250) {
+                // Resample to Volca sample rate for waveform display and playback
+                match resample_audio(&samples, original_sample_rate, VOLCA_SAMPLE_RATE) {
                     Ok(resampled) => {
                         let resampled_count = resampled.len();
 
-                        // Store original in downloaded_samples (in-memory only, not on device)
+                        // Store original in downloaded_samples (in-memory only)
                         state_load_wav.downloaded_samples.lock().unwrap().insert(
                             slot as u8,
                             OriginalSample {
-                                samples: samples.clone(),  // Store ORIGINAL at original rate
+                                samples: samples.clone(),
                                 original_sample_rate,
                                 current_speed: speed,
-                            }
+                            },
                         );
 
                         // Update SampleInfo with new metadata and mark as edited
                         let updated_info = SampleInfo {
                             slot,
                             name: SharedString::from(&name),
-                            length: resampled_count as i32,  // Length at 31.25kHz
+                            length: resampled_count as i32,
                             speed: speed as i32,
                             has_sample: true,
-                            name_edited: true,  // Mark as edited (shows ✏️)
+                            name_edited: true,
                         };
-                        state_load_wav.samples.set_row_data(slot as usize, updated_info);
+                        state_load_wav
+                            .samples
+                            .set_row_data(slot as usize, updated_info);
 
                         // Regenerate waveform display using resampled data
                         let width = ui.get_waveform_display_width();
                         let height = ui.get_waveform_display_height();
-                        let waveform_path = generate_waveform_path(&resampled, 1000, width as f64, height as f64);
+                        let waveform_path = generate_waveform_path(
+                            &resampled,
+                            WAVEFORM_POINTS,
+                            width as f64,
+                            height as f64,
+                        );
 
                         // Update UI
                         ui.set_selected_sample_name(SharedString::from(&name));
@@ -1075,43 +804,46 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                         ui.set_waveform_path(SharedString::from(waveform_path));
                         ui.set_samples(state_load_wav.samples.clone().into());
 
-                        state_load_wav.log(format!("Loaded WAV: {} ({:.2}s, {:.2} kHz) - not saved to device",
-                                                   name, duration_secs, display_rate_khz));
+                        state_load_wav.log(format!(
+                            "Loaded WAV: {} ({:.2}s, {:.2} kHz) - not saved to device",
+                            name, duration_secs, display_rate_khz
+                        ));
                     }
                     Err(e) => {
-                        println!("ERROR resampling WAV: {}", e);
+                        error!("Resampling WAV failed: {}", e);
                         state_load_wav.log(format!("Failed to resample WAV: {}", e));
                     }
                 }
             }
             Err(e) => {
-                println!("ERROR loading WAV: {}", e);
+                error!("Loading WAV failed: {}", e);
                 state_load_wav.log(format!("Failed to load WAV: {}", e));
             }
         }
     });
 
-    // Name edit accepted callback - update name and set edited flag
+    // Name edit accepted callback
     let state_name_edit = state.clone();
     ui.on_name_edit_accepted(move |slot, new_name| {
         let new_name_str = new_name.to_string();
 
-        state_name_edit.log(format!("Name edited for slot {}: \"{}\" (not yet saved)", slot, new_name_str));
+        state_name_edit.log(format!(
+            "Name edited for slot {}: \"{}\" (not yet saved)",
+            slot, new_name_str
+        ));
 
-        // Update UI with new name and set edited flag
         if let Some(mut sample) = state_name_edit.get_sample(slot) {
             sample.name = SharedString::from(&new_name_str);
             sample.name_edited = true;
             state_name_edit.samples.set_row_data(slot as usize, sample);
 
-            // Update UI
             if let Some(ui) = state_name_edit.ui.upgrade() {
                 ui.set_samples(state_name_edit.samples.clone().into());
             }
         }
     });
 
-    // Clear name edited flag callback - called from background thread via invoke_from_event_loop
+    // Clear name edited flag callback
     let state_clear_flag = state.clone();
     ui.on_clear_name_edited_flag(move |slot| {
         if let Some(mut sample) = state_clear_flag.get_sample(slot) {
@@ -1124,7 +856,7 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         }
     });
 
-    // Update sample from device callback - used after refresh to sync with device state
+    // Update sample from device callback
     let state_update_sample = state.clone();
     ui.on_update_sample_from_device(move |slot, name, length, speed| {
         let updated_info = SampleInfo {
@@ -1133,20 +865,21 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
             length,
             speed,
             has_sample: true,
-            name_edited: false,  // Clear edited flag when refreshing from device
+            name_edited: false,
         };
-        state_update_sample.samples.set_row_data(slot as usize, updated_info);
+        state_update_sample
+            .samples
+            .set_row_data(slot as usize, updated_info);
 
         if let Some(ui) = state_update_sample.ui.upgrade() {
             ui.set_samples(state_update_sample.samples.clone().into());
         }
     });
 
-    // Save to device callback - write SampleHeader back to device
+    // Save to device callback
     let state_save = state.clone();
     let ui_weak_save = ui_weak.clone();
     ui.on_save_to_device_clicked(move |slot| {
-        // Get current sample info
         let sample = match state_save.get_sample(slot) {
             Some(s) if s.has_sample => s,
             _ => {
@@ -1156,169 +889,123 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         };
 
         let ui = ui_weak_save.unwrap();
-
-        // Set loading state BEFORE starting save
         ui.set_loading_slot(slot);
-        state_save.log(format!("Saving sample info for slot {}: \"{}\"...", slot, sample.name));
+        state_save.log(format!(
+            "Saving sample info for slot {}: \"{}\"...",
+            slot, sample.name
+        ));
 
-        // Spawn background thread for save operation
         let device_ref = state_save.device.clone();
         let downloaded_ref = state_save.downloaded_samples.clone();
         let ui_weak = state_save.ui.clone();
         let sample_name = sample.name.to_string();
 
         std::thread::spawn(move || {
-            use std::time::{Instant, Duration};
-            use volsa2_core::proto::{SampleHeader, SampleData, Status};
+            use std::time::Duration;
+            use volsa2_core::proto::{SampleData, SampleHeader, Status};
 
             let start_time = Instant::now();
 
-            // Get original sample and resample to 31.25kHz for device
-            let (audio_data, final_speed) = match downloaded_ref.lock().unwrap().get(&(slot as u8)) {
-                Some(orig) => {
-                    match orig.resample_to(31250) {
+            // Get original sample and resample to Volca sample rate for device
+            let (audio_data, final_speed) =
+                match downloaded_ref.lock().unwrap().get(&(slot as u8)) {
+                    Some(orig) => match orig.resample_to(VOLCA_SAMPLE_RATE) {
                         Ok(result) => result,
                         Err(e) => {
-                            println!("ERROR resampling for save: {}", e);
-                            let ui_weak_clone = ui_weak.clone();
-                            slint::invoke_from_event_loop(move || {
-                                if let Some(ui) = ui_weak_clone.upgrade() {
-                                    ui.set_loading_slot(-1);
-                                }
-                            }).ok();
+                            error!("Resampling for save failed: {}", e);
+                            clear_loading_slot(&ui_weak);
                             return;
                         }
+                    },
+                    None => {
+                        error!("Sample not downloaded. Download first before saving.");
+                        clear_loading_slot(&ui_weak);
+                        return;
                     }
-                },
-                None => {
-                    println!("ERROR: Sample not downloaded. Download first before saving.");
-                    let ui_weak_clone = ui_weak.clone();
-                    slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_weak_clone.upgrade() {
-                            ui.set_loading_slot(-1);
-                        }
-                    }).ok();
-                    return;
-                }
+                };
+
+            let mut device_guard = device_ref.lock().unwrap();
+            let Some(device) = device_guard.as_mut() else {
+                error!("Device not connected");
+                clear_loading_slot(&ui_weak);
+                return;
             };
 
-            // Get device and send both header and data
-            let mut device_guard = device_ref.lock().unwrap();
-            if let Some(device) = device_guard.as_mut() {
-                // Create SampleHeader with updated name and resampled speed
-                let header = SampleHeader {
-                    sample_no: slot as u8,
-                    name: sample_name.clone(),
-                    length: audio_data.len() as u32,  // Use actual resampled length
-                    level: 65535,  // SampleHeader::DEFAULT_LEVEL
-                    speed: final_speed,  // Use speed from resampling
-                };
+            let header = SampleHeader {
+                sample_no: slot as u8,
+                name: sample_name.clone(),
+                length: audio_data.len() as u32,
+                level: 65535,
+                speed: final_speed,
+            };
 
-                // Create SampleData with unchanged audio
-                let data = SampleData {
-                    sample_no: slot as u8,
-                    data: audio_data,
-                };
+            let data = SampleData {
+                sample_no: slot as u8,
+                data: audio_data,
+            };
 
-                // Send header and wait for ACK, then data and wait for ACK
-                match device.send_message(&header) {
-                    Ok(()) => {
-                        // Wait for ACK after header
-                        match device.receive_message::<Status>(Duration::from_millis(500)) {
-                            Ok(status) => {
-                                if let Err(e) = status {
-                                    println!("✗ Device NAK after header: {}", e);
-                                    let ui_weak_clone = ui_weak.clone();
-                                    slint::invoke_from_event_loop(move || {
-                                        if let Some(ui) = ui_weak_clone.upgrade() {
-                                            ui.set_loading_slot(-1);
-                                        }
-                                    }).ok();
-                                    return;
-                                }
+            // Send header
+            if let Err(e) = device.send_message(&header) {
+                error!("Failed to send header: {}", e);
+                clear_loading_slot(&ui_weak);
+                return;
+            }
 
-                                // Header ACK received, now send data
-                                match device.send_message(&data) {
-                                    Ok(()) => {
-                                        // Wait for ACK after data
-                                        match device.receive_message::<Status>(Duration::from_millis(500)) {
-                                            Ok(status) => {
-                                                if let Err(e) = status {
-                                                    println!("✗ Device NAK after data: {}", e);
-                                                    let ui_weak_clone = ui_weak.clone();
-                                                    slint::invoke_from_event_loop(move || {
-                                                        if let Some(ui) = ui_weak_clone.upgrade() {
-                                                            ui.set_loading_slot(-1);
-                                                        }
-                                                    }).ok();
-                                                    return;
-                                                }
-
-                                                // Success! Both ACKs received
-                                                let elapsed = start_time.elapsed();
-                                                println!("✓ Saved sample (header+data) for slot {} in {:.3}s", slot, elapsed.as_secs_f64());
-
-                                                // Clear name_edited flag and loading state on main thread
-                                                let ui_weak_clone = ui_weak.clone();
-                                                slint::invoke_from_event_loop(move || {
-                                                    if let Some(ui) = ui_weak_clone.upgrade() {
-                                                        ui.invoke_clear_name_edited_flag(slot);
-                                                        ui.set_loading_slot(-1);
-                                                    }
-                                                }).ok();
-                                            }
-                                            Err(e) => {
-                                                println!("✗ Failed to receive ACK after data: {}", e);
-                                                let ui_weak_clone = ui_weak.clone();
-                                                slint::invoke_from_event_loop(move || {
-                                                    if let Some(ui) = ui_weak_clone.upgrade() {
-                                                        ui.set_loading_slot(-1);
-                                                    }
-                                                }).ok();
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("✗ Failed to send data: {}", e);
-                                        let ui_weak_clone = ui_weak.clone();
-                                        slint::invoke_from_event_loop(move || {
-                                            if let Some(ui) = ui_weak_clone.upgrade() {
-                                                ui.set_loading_slot(-1);
-                                            }
-                                        }).ok();
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("✗ Failed to receive ACK after header: {}", e);
-                                let ui_weak_clone = ui_weak.clone();
-                                slint::invoke_from_event_loop(move || {
-                                    if let Some(ui) = ui_weak_clone.upgrade() {
-                                        ui.set_loading_slot(-1);
-                                    }
-                                }).ok();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("✗ Failed to send header: {}", e);
-                        let ui_weak_clone = ui_weak.clone();
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_weak_clone.upgrade() {
-                                ui.set_loading_slot(-1);
-                            }
-                        }).ok();
+            // Wait for ACK after header
+            match device.receive_message::<Status>(Duration::from_millis(500)) {
+                Ok(status) => {
+                    if let Err(e) = status {
+                        error!("Device NAK after header: {}", e);
+                        clear_loading_slot(&ui_weak);
+                        return;
                     }
                 }
-            } else {
-                println!("ERROR: Device not connected");
-                let ui_weak_clone = ui_weak.clone();
-                slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak_clone.upgrade() {
-                        ui.set_loading_slot(-1);
-                    }
-                }).ok();
+                Err(e) => {
+                    error!("Failed to receive ACK after header: {}", e);
+                    clear_loading_slot(&ui_weak);
+                    return;
+                }
             }
+
+            // Send data
+            if let Err(e) = device.send_message(&data) {
+                error!("Failed to send data: {}", e);
+                clear_loading_slot(&ui_weak);
+                return;
+            }
+
+            // Wait for ACK after data
+            match device.receive_message::<Status>(Duration::from_millis(500)) {
+                Ok(status) => {
+                    if let Err(e) = status {
+                        error!("Device NAK after data: {}", e);
+                        clear_loading_slot(&ui_weak);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to receive ACK after data: {}", e);
+                    clear_loading_slot(&ui_weak);
+                    return;
+                }
+            }
+
+            // Success
+            let elapsed = start_time.elapsed();
+            info!(
+                "Saved sample (header+data) for slot {} in {:.3}s",
+                slot,
+                elapsed.as_secs_f64()
+            );
+
+            let ui_weak_clone = ui_weak.clone();
+            slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_weak_clone.upgrade() {
+                    ui.invoke_clear_name_edited_flag(slot);
+                    ui.set_loading_slot(-1);
+                }
+            })
+            .ok();
         });
     });
 }

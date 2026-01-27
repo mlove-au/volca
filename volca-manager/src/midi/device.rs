@@ -198,7 +198,7 @@ impl MidiDevice {
     }
 
     /// Fetch sample audio data from a specific slot
-    pub fn get_sample_data(&mut self, slot: u8, _expected_length: usize) -> Result<SampleData> {
+    pub fn get_sample_data(&mut self, slot: u8) -> Result<SampleData> {
         // Clear buffer
         if let Ok(mut buffer) = self.input_buffer.lock() {
             buffer.clear();
