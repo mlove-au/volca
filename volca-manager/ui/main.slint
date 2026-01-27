@@ -9,6 +9,24 @@ export struct SampleInfo {
     name-edited: bool,
 }
 
+// Status LED indicator with proper vertical centering
+component StatusLED inherits Rectangle {
+    in property <bool> active: false;
+
+    width: 10px;
+
+    VerticalLayout {
+        alignment: center;
+
+        Rectangle {
+            width: 10px;
+            height: 10px;
+            border-radius: 5px;
+            background: root.active ? #4caf50 : #f44336;
+        }
+    }
+}
+
 // Custom button with proper text centering
 component CustomButton inherits Rectangle {
     in property <string> text;
@@ -483,19 +501,12 @@ export component AppWindow inherits Window {
 
             // ========== SECTION 1: HEADER (LED, Status, Buttons) ==========
             Rectangle {
-                border-width: 1px;
-                border-color: #cccccc;
-                border-radius: 4px;
-
                 HorizontalLayout {
                     padding: 10px;
                     spacing: 16px;
 
-                    Rectangle {
-                        width: 10px;
-                        height: 10px;
-                        border-radius: 5px;
-                        background: connected ? #4caf50 : #f44336;
+                    StatusLED {
+                        active: connected;
                     }
 
                     Text {
@@ -528,10 +539,6 @@ export component AppWindow inherits Window {
 
             // ========== SECTION 2: SAMPLE PADS (Navigation + Grid) ==========
             Rectangle {
-                border-width: 1px;
-                border-color: #cccccc;
-                border-radius: 4px;
-
                 VerticalLayout {
                     padding: 10px;
                     spacing: 8px;
@@ -612,9 +619,6 @@ export component AppWindow inherits Window {
             // ========== SECTION 3: WAVEFORM VIEWER (Display + Controls) ==========
             Rectangle {
                 vertical-stretch: 1;
-                border-width: 1px;
-                border-color: #cccccc;
-                border-radius: 4px;
 
                 VerticalLayout {
                     padding: 10px;
@@ -662,10 +666,6 @@ export component AppWindow inherits Window {
 
             // ========== SECTION 4: STATUS BAR (Info + Debug Log Toggle) ==========
             Rectangle {
-                border-width: 1px;
-                border-color: #cccccc;
-                border-radius: 4px;
-
                 HorizontalLayout {
                     padding: 10px;
                     spacing: 12px;
@@ -698,9 +698,6 @@ export component AppWindow inherits Window {
             // Debug log viewer (toggle with Cmd+D)
             if show-debug-log: Rectangle {
                 height: 120px;
-                border-width: 1px;
-                border-color: #cccccc;
-                border-radius: 4px;
                 background: #1e1e1e;
 
                 VerticalLayout {

@@ -21,6 +21,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hound.workspace = true
+rubato.workspace = true
 chrono = "0.4"
 
 [build-dependencies]

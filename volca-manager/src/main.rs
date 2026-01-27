@@ -91,46 +91,136 @@ fn generate_waveform_path(samples: &[i16], num_points: usize, width: f64, height
     path
 }
 
-/// Load WAV file and prepare for Volca Sample 2
-/// Returns (samples, speed, sample_rate_khz) or error
-fn load_wav_file(path: &std::path::Path) -> Result<(Vec<i16>, u16, f32), String> {
-    use volsa2_core::audio::{AudioReader, VOLCA_SAMPLERATE};
+/// Load WAV file and store at original sample rate
+/// Returns (original_sample_rate, samples_at_original_rate, speed_for_original_rate)
+fn load_wav_file(path: &std::path::Path) -> Result<(u32, Vec<i16>, u16), String> {
+    use volsa2_core::audio::VOLCA_SAMPLERATE;
+    use hound::SampleFormat;
 
-    // First, read the WAV spec to get original sample rate
-    let wav_reader = hound::WavReader::open(path)
+    // Open WAV file
+    let mut wav_reader = hound::WavReader::open(path)
         .map_err(|e| format!("Failed to open WAV: {}", e))?;
     let spec = wav_reader.spec();
     let original_sample_rate = spec.sample_rate;
-    drop(wav_reader);  // Close the reader so AudioReader can open it
+    let channels = spec.channels;
 
-    // Now use AudioReader for proper processing
-    let audio = AudioReader::open_file(path)
-        .map_err(|e| format!("Failed to open WAV: {}", e))?;
+    // Read samples based on format and convert to mono i16 at original rate
+    let samples: Vec<i16> = match (spec.sample_format, spec.bits_per_sample, channels) {
+        // 16-bit int mono
+        (SampleFormat::Int, 16, 1) => {
+            wav_reader.samples::<i16>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read samples: {}", e))?
+        },
+        // 16-bit int stereo - mix to mono
+        (SampleFormat::Int, 16, 2) => {
+            let all_samples: Vec<i16> = wav_reader.samples::<i16>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read samples: {}", e))?;
+            all_samples.chunks_exact(2)
+                .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
+                .collect()
+        },
+        // 32-bit float - convert to i16
+        (SampleFormat::Float, 32, 1) => {
+            wav_reader.samples::<f32>()
+                .map(|s| s.map(|f| (f * i16::MAX as f32).round() as i16))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read samples: {}", e))?
+        },
+        // 32-bit float stereo - mix to mono
+        (SampleFormat::Float, 32, 2) => {
+            let all_samples: Vec<f32> = wav_reader.samples::<f32>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read samples: {}", e))?;
+            all_samples.chunks_exact(2)
+                .map(|chunk| (((chunk[0] + chunk[1]) / 2.0) * i16::MAX as f32).round() as i16)
+                .collect()
+        },
+        // Unsupported format
+        _ => {
+            return Err(format!("Unsupported WAV format: {} bit {:?}, {} channels",
+                             spec.bits_per_sample, spec.sample_format, channels));
+        }
+    };
 
-    let channels = audio.channels();
-
-    // Convert to mono and resample as needed
-    let samples = match channels {
-        1 => audio.resample_to_volca(),  // Already mono
-        _ => audio.take_mid().resample_to_volca(),  // Convert stereo to mono (L+R)/2
-    }
-    .map_err(|e| format!("Failed to process audio: {}", e))?;
-
-    // Calculate speed parameter for playback
-    // speed = (original_rate / 31250) * 16384
-    // If we resampled DOWN (original > 31.25kHz), speed stays at 16384 (1.0x)
-    // If original was lower, speed adjusts for slower playback
+    // Calculate speed for original rate
     let speed = if original_sample_rate > VOLCA_SAMPLERATE {
-        16384  // Resampled to 31.25kHz, play at 1x
+        16384  // Will resample to 31.25kHz, play at 1x
     } else {
-        // Calculate speed for lower sample rates
         ((original_sample_rate as f32 / VOLCA_SAMPLERATE as f32) * 16384.0) as u16
     };
 
-    // Calculate display sample rate in kHz
-    let display_rate_khz = 31.25 * speed as f32 / 16384.0;
+    Ok((original_sample_rate, samples, speed))
+}
 
-    Ok((samples, speed, display_rate_khz))
+/// Resample audio from source rate to target rate
+fn resample_audio(samples: &[i16], from_rate: u32, to_rate: u32) -> Result<Vec<i16>, String> {
+    use rubato::{FftFixedIn, Resampler};
+
+    if from_rate == to_rate {
+        return Ok(samples.to_vec());
+    }
+
+    // Convert i16 samples to f64 for rubato
+    let samples_f64: Vec<f64> = samples.iter()
+        .map(|&s| s as f64 / i16::MAX as f64)
+        .collect();
+
+    // Create resampler
+    let mut resampler = FftFixedIn::new(
+        from_rate as usize,
+        to_rate as usize,
+        samples.len(),
+        samples.len(),
+        1,  // mono
+    ).map_err(|e| format!("Failed to create resampler: {}", e))?;
+
+    // Resample
+    let result = resampler.process(&[samples_f64], None)
+        .map_err(|e| format!("Resampling failed: {}", e))?
+        .pop()
+        .unwrap();
+
+    // Convert back to i16
+    Ok(result.into_iter()
+        .map(|s| (s * i16::MAX as f64).round() as i16)
+        .collect())
+}
+
+/// Stores original sample data for lossless resampling
+#[derive(Clone)]
+pub struct OriginalSample {
+    samples: Vec<i16>,           // Original samples at original sample rate
+    original_sample_rate: u32,   // Original sample rate (e.g., 44100, 16000)
+    current_speed: u16,          // Current playback speed (for display rate)
+}
+
+impl OriginalSample {
+    /// Get current effective sample rate in Hz
+    fn current_sample_rate(&self) -> f32 {
+        31250.0 * self.current_speed as f32 / 16384.0
+    }
+
+    /// Resample to target rate, returning (resampled_samples, new_speed)
+    fn resample_to(&self, target_rate: u32) -> Result<(Vec<i16>, u16), String> {
+        use volsa2_core::audio::VOLCA_SAMPLERATE;
+
+        // Calculate speed parameter for target rate
+        let speed = ((target_rate as f32 / VOLCA_SAMPLERATE as f32) * 16384.0) as u16;
+
+        // If target rate == original rate, no resampling needed
+        if target_rate == self.original_sample_rate {
+            return Ok((self.samples.clone(), speed));
+        }
+
+        // Resample from original to target rate
+        // Note: We resample to 31.25kHz but adjust speed for effective playback rate
+        let resampled = resample_audio(&self.samples, self.original_sample_rate, VOLCA_SAMPLERATE)
+            .map_err(|e| format!("Resample failed: {}", e))?;
+
+        Ok((resampled, speed))
+    }
 }
 
 pub struct AppState {
@@ -140,7 +230,7 @@ pub struct AppState {
     pub firmware_version: String,
     pub logs: Rc<VecModel<SharedString>>,
     pub ui: slint::Weak<AppWindow>,
-    pub downloaded_samples: Arc<Mutex<HashMap<u8, (Vec<i16>, u16)>>>,  // Arc for thread-safety (audio_data, speed)
+    pub downloaded_samples: Arc<Mutex<HashMap<u8, OriginalSample>>>,  // Arc for thread-safety
     pub stop_sender: Arc<Mutex<Option<Sender<()>>>>,  // Arc for thread-safety
     pub is_playing: Arc<AtomicBool>,  // Thread-safe playback state
     pub playback_info: Arc<Mutex<Option<(Instant, f64)>>>,  // (start_time, duration_secs)
@@ -459,6 +549,39 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.run()
 }
 
+/// Update UI after downloading a sample from the device
+fn update_ui_after_download(
+    ui_weak: &slint::Weak<AppWindow>,
+    slot: i32,
+    waveform_data: Vec<i16>,
+    header_speed: u16,
+    update_sample_info: Option<(String, u32)>,  // (name, length) - if provided, updates SampleInfo
+) {
+    let ui_weak_clone = ui_weak.clone();
+    slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak_clone.upgrade() {
+            // Optionally update SampleInfo with fresh data from device (clears any unsaved edits)
+            if let Some((name, length)) = update_sample_info {
+                ui.invoke_update_sample_from_device(
+                    slot,
+                    SharedString::from(name),
+                    length as i32,
+                    header_speed as i32
+                );
+            }
+
+            // Generate and display waveform
+            let width = ui.get_waveform_display_width();
+            let height = ui.get_waveform_display_height();
+            let waveform_path = generate_waveform_path(&waveform_data, 1000, width as f64, height as f64);
+            ui.set_waveform_path(SharedString::from(waveform_path));
+
+            // Clear loading state
+            ui.set_loading_slot(-1);
+        }
+    }).ok();
+}
+
 fn setup_callbacks(ui: &AppWindow, state: AppState) {
     let ui_weak = ui.as_weak();
 
@@ -559,40 +682,27 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                             Ok(sample_data) => {
                                 let elapsed = start_time.elapsed();
 
-                                // Store in memory
+                                // Store in memory as OriginalSample
                                 let audio_data_clone = sample_data.data.clone();
                                 downloaded_ref.lock().unwrap().insert(
                                     slot as u8,
-                                    (audio_data_clone.clone(), header.speed)
+                                    OriginalSample {
+                                        samples: audio_data_clone.clone(),
+                                        original_sample_rate: 31250,  // Device samples are always 31.25kHz
+                                        current_speed: header.speed,
+                                    }
                                 );
 
-                                // Update UI on main thread with fresh sample info
-                                let waveform_data = audio_data_clone.clone();
-                                let header_name = header.name.clone();
-                                let header_length = header.length;
-                                let header_speed = header.speed;
                                 println!("✓ Refreshed in {:.3}s", elapsed.as_secs_f64());
-                                let ui_weak_clone = ui_weak.clone();
-                                slint::invoke_from_event_loop(move || {
-                                    if let Some(ui) = ui_weak_clone.upgrade() {
-                                        // Update SampleInfo with fresh data from device (clears any unsaved edits)
-                                        ui.invoke_update_sample_from_device(
-                                            slot,
-                                            SharedString::from(header_name),
-                                            header_length as i32,
-                                            header_speed as i32
-                                        );
 
-                                        // Generate and display waveform
-                                        let width = ui.get_waveform_display_width();
-                                        let height = ui.get_waveform_display_height();
-                                        let waveform_path = generate_waveform_path(&waveform_data, 1000, width as f64, height as f64);
-                                        ui.set_waveform_path(SharedString::from(waveform_path));
-
-                                        // Clear loading state
-                                        ui.set_loading_slot(-1);
-                                    }
-                                }).ok();
+                                // Update UI with fresh sample info from device (clears any unsaved edits)
+                                update_ui_after_download(
+                                    &ui_weak,
+                                    slot,
+                                    audio_data_clone,
+                                    header.speed,
+                                    Some((header.name.clone(), header.length))
+                                );
                             }
                             Err(e) => {
                                 let error_msg = format!("✗ Refresh failed: {}", e);
@@ -644,7 +754,9 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         if let Some(sample) = state_play.get_sample(slot) {
             if sample.has_sample {
                 // Check if we have the sample data in memory - clone immediately to avoid holding lock
-                let maybe_audio_data = state_play.downloaded_samples.lock().unwrap().get(&(slot as u8)).map(|(data, speed)| (data.clone(), *speed));
+                let maybe_audio_data = state_play.downloaded_samples.lock().unwrap()
+                    .get(&(slot as u8))
+                    .map(|orig| (orig.samples.clone(), orig.current_speed));
                 if let Some((audio_data, speed)) = maybe_audio_data {
                     let sample_count = audio_data.len();
                     let effective_rate = (31250.0 * (speed as f64 / 16384.0)) as u32;
@@ -755,8 +867,10 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
 
             // Check if we have downloaded audio data for this slot
             // Clone the data immediately to avoid holding the lock
-            let maybe_audio_data = state_select.downloaded_samples.lock().unwrap().get(&(slot as u8)).map(|(data, speed)| (data.clone(), *speed));
-                if let Some((audio_data, _speed)) = maybe_audio_data {
+            let maybe_sample_data = state_select.downloaded_samples.lock().unwrap()
+                .get(&(slot as u8))
+                .map(|orig| orig.samples.clone());
+            if let Some(audio_data) = maybe_sample_data {
                     state_select.log(format!("Selected slot {}: {} ({} samples)", slot, sample.name, audio_data.len()));
 
                     // Generate SVG path for waveform using current display dimensions
@@ -791,29 +905,27 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                                         Ok(sample_data) => {
                                             let elapsed = start_time.elapsed();
 
-                                            // Store in memory
+                                            // Store in memory as OriginalSample
                                             let audio_data_clone = sample_data.data.clone();
                                             downloaded_ref.lock().unwrap().insert(
                                                 slot as u8,
-                                                (audio_data_clone.clone(), header.speed)
+                                                OriginalSample {
+                                                    samples: audio_data_clone.clone(),
+                                                    original_sample_rate: 31250,  // Device samples are always 31.25kHz
+                                                    current_speed: header.speed,
+                                                }
                                             );
 
-                                            // Update UI on main thread
-                                            let waveform_data = audio_data_clone.clone();
                                             println!("✓ Downloaded in {:.3}s", elapsed.as_secs_f64());
-                                            let ui_weak_clone = ui_weak.clone();
-                                            slint::invoke_from_event_loop(move || {
-                                                if let Some(ui) = ui_weak_clone.upgrade() {
-                                                    // Generate and display waveform
-                                                    let width = ui.get_waveform_display_width();
-                                                    let height = ui.get_waveform_display_height();
-                                                    let waveform_path = generate_waveform_path(&waveform_data, 1000, width as f64, height as f64);
-                                                    ui.set_waveform_path(SharedString::from(waveform_path));
 
-                                                    // Clear loading state
-                                                    ui.set_loading_slot(-1);
-                                                }
-                                            }).ok();
+                                            // Update UI (don't update SampleInfo - keep existing data)
+                                            update_ui_after_download(
+                                                &ui_weak,
+                                                slot,
+                                                audio_data_clone,
+                                                header.speed,
+                                                None  // Don't update SampleInfo, just waveform
+                                            );
                                         }
                                         Err(e) => {
                                             let error_msg = format!("✗ Download failed: {}", e);
@@ -866,7 +978,9 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         if let Some(sample) = state_regen.get_sample(slot) {
             if sample.has_sample {
                 // Clone the data immediately to avoid holding the lock
-                let maybe_audio_data = state_regen.downloaded_samples.lock().unwrap().get(&(slot as u8)).map(|(data, speed)| (data.clone(), *speed));
+                let maybe_audio_data = state_regen.downloaded_samples.lock().unwrap()
+                    .get(&(slot as u8))
+                    .map(|orig| (orig.samples.clone(), orig.current_speed));
                 if let Some((audio_data, _speed)) = maybe_audio_data {
                     // Regenerate waveform with new dimensions
                     let waveform_path = generate_waveform_path(&audio_data, 1000, width as f64, height as f64);
@@ -903,12 +1017,13 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
 
         // Load and process WAV file
         match load_wav_file(&path) {
-            Ok((samples, speed, display_rate_khz)) => {
-                let sample_count = samples.len();
-                let duration_secs = sample_count as f32 / 31250.0;
+            Ok((original_sample_rate, samples, speed)) => {
+                let original_sample_count = samples.len();
+                let duration_secs = original_sample_count as f32 / original_sample_rate as f32;
+                let display_rate_khz = 31.25 * speed as f32 / 16384.0;
 
-                println!("Loaded {} samples ({:.2}s) at {:.2} kHz",
-                         sample_count, duration_secs, display_rate_khz);
+                println!("Loaded {} samples ({:.2}s) at {} Hz (effective {:.2} kHz)",
+                         original_sample_count, duration_secs, original_sample_rate, display_rate_khz);
 
                 // Extract filename for display
                 let filename = path.file_stem()
@@ -923,36 +1038,51 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
                     filename
                 };
 
-                // Store in downloaded_samples (in-memory only, not on device)
-                state_load_wav.downloaded_samples.lock().unwrap().insert(
-                    slot as u8,
-                    (samples.clone(), speed)
-                );
+                // Resample to 31.25kHz for waveform display and playback
+                match resample_audio(&samples, original_sample_rate, 31250) {
+                    Ok(resampled) => {
+                        let resampled_count = resampled.len();
 
-                // Update SampleInfo with new metadata and mark as edited
-                let updated_info = SampleInfo {
-                    slot,
-                    name: SharedString::from(&name),
-                    length: sample_count as i32,
-                    speed: speed as i32,
-                    has_sample: true,
-                    name_edited: true,  // Mark as edited (shows ✏️)
-                };
-                state_load_wav.samples.set_row_data(slot as usize, updated_info);
+                        // Store original in downloaded_samples (in-memory only, not on device)
+                        state_load_wav.downloaded_samples.lock().unwrap().insert(
+                            slot as u8,
+                            OriginalSample {
+                                samples: samples.clone(),  // Store ORIGINAL at original rate
+                                original_sample_rate,
+                                current_speed: speed,
+                            }
+                        );
 
-                // Regenerate waveform display
-                let width = ui.get_waveform_display_width();
-                let height = ui.get_waveform_display_height();
-                let waveform_path = generate_waveform_path(&samples, 1000, width as f64, height as f64);
+                        // Update SampleInfo with new metadata and mark as edited
+                        let updated_info = SampleInfo {
+                            slot,
+                            name: SharedString::from(&name),
+                            length: resampled_count as i32,  // Length at 31.25kHz
+                            speed: speed as i32,
+                            has_sample: true,
+                            name_edited: true,  // Mark as edited (shows ✏️)
+                        };
+                        state_load_wav.samples.set_row_data(slot as usize, updated_info);
 
-                // Update UI
-                ui.set_selected_sample_name(SharedString::from(&name));
-                ui.set_selected_sample_length(sample_count as i32);
-                ui.set_waveform_path(SharedString::from(waveform_path));
-                ui.set_samples(state_load_wav.samples.clone().into());
+                        // Regenerate waveform display using resampled data
+                        let width = ui.get_waveform_display_width();
+                        let height = ui.get_waveform_display_height();
+                        let waveform_path = generate_waveform_path(&resampled, 1000, width as f64, height as f64);
 
-                state_load_wav.log(format!("Loaded WAV: {} ({:.2}s, {:.2} kHz) - not saved to device",
-                                           name, duration_secs, display_rate_khz));
+                        // Update UI
+                        ui.set_selected_sample_name(SharedString::from(&name));
+                        ui.set_selected_sample_length(resampled_count as i32);
+                        ui.set_waveform_path(SharedString::from(waveform_path));
+                        ui.set_samples(state_load_wav.samples.clone().into());
+
+                        state_load_wav.log(format!("Loaded WAV: {} ({:.2}s, {:.2} kHz) - not saved to device",
+                                                   name, duration_secs, display_rate_khz));
+                    }
+                    Err(e) => {
+                        println!("ERROR resampling WAV: {}", e);
+                        state_load_wav.log(format!("Failed to resample WAV: {}", e));
+                    }
+                }
             }
             Err(e) => {
                 println!("ERROR loading WAV: {}", e);
@@ -1036,8 +1166,6 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
         let downloaded_ref = state_save.downloaded_samples.clone();
         let ui_weak = state_save.ui.clone();
         let sample_name = sample.name.to_string();
-        let sample_length = sample.length as u32;
-        let sample_speed = sample.speed as u16;
 
         std::thread::spawn(move || {
             use std::time::{Instant, Duration};
@@ -1045,11 +1173,25 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
 
             let start_time = Instant::now();
 
-            // Check if sample is downloaded (need audio data to persist name change)
-            let audio_data = match downloaded_ref.lock().unwrap().get(&(slot as u8)) {
-                Some((data, _)) => data.clone(),
+            // Get original sample and resample to 31.25kHz for device
+            let (audio_data, final_speed) = match downloaded_ref.lock().unwrap().get(&(slot as u8)) {
+                Some(orig) => {
+                    match orig.resample_to(31250) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            println!("ERROR resampling for save: {}", e);
+                            let ui_weak_clone = ui_weak.clone();
+                            slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_weak_clone.upgrade() {
+                                    ui.set_loading_slot(-1);
+                                }
+                            }).ok();
+                            return;
+                        }
+                    }
+                },
                 None => {
-                    println!("ERROR: Sample not downloaded. Download first before saving name changes.");
+                    println!("ERROR: Sample not downloaded. Download first before saving.");
                     let ui_weak_clone = ui_weak.clone();
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak_clone.upgrade() {
@@ -1063,13 +1205,13 @@ fn setup_callbacks(ui: &AppWindow, state: AppState) {
             // Get device and send both header and data
             let mut device_guard = device_ref.lock().unwrap();
             if let Some(device) = device_guard.as_mut() {
-                // Create SampleHeader with updated name
+                // Create SampleHeader with updated name and resampled speed
                 let header = SampleHeader {
                     sample_no: slot as u8,
                     name: sample_name.clone(),
-                    length: sample_length,
+                    length: audio_data.len() as u32,  // Use actual resampled length
                     level: 65535,  // SampleHeader::DEFAULT_LEVEL
-                    speed: sample_speed,
+                    speed: final_speed,  // Use speed from resampling
                 };
 
                 // Create SampleData with unchanged audio

@@ -5345,6 +5345,7 @@ dependencies = [
  "hound",
  "rfd",
  "rodio",
+ "rubato",
  "slint",
  "slint-build",
  "thiserror 1.0.69",

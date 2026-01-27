@@ -27,7 +27,12 @@
       "Bash(/Users/mlove/.cargo/bin/cargo run)",
       "Bash(cargo tree:*)",
       "WebFetch(domain:docs.slint.dev)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(/Users/mlove/.cargo/bin/cargo check:*)",
+      "Bash(git commit:*)",
+      "WebFetch(domain:orangefreesounds.com)",
+      "Bash(afplay:*)",
+      "Bash(/Users/mlove/.cargo/bin/cargo run --bin volca-manager)"
     ]
   }
 }
