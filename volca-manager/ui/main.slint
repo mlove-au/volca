@@ -514,6 +514,7 @@ export component AppWindow inherits Window {
                         font-size: 14px;
                         font-weight: 600;
                         vertical-alignment: center;
+                        horizontal-alignment: center;
                     }
 
                     Rectangle {
@@ -546,7 +547,7 @@ export component AppWindow inherits Window {
                     // Page navigation
                     HorizontalLayout {
                         height: 36px;
-                        spacing: 12px;
+                        spacing: 0px;
 
                         Button {
                             text: "◀";
@@ -556,10 +557,20 @@ export component AppWindow inherits Window {
                             enabled: current-page > 0;
                         }
 
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+
                         Text {
                             text: "Page " + (current-page + 1) + "/" + total-pages + " (Slots " + start-slot + "-" + (start-slot + 9) + ")";
                             font-size: 12px;
                             font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
                         }
 
                         Button {
@@ -571,46 +582,56 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // 5x2 Sample Grid
-                    VerticalLayout {
-                        spacing: 10px;
+                    // 5x2 Sample Grid (centered)
+                    HorizontalLayout {
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
 
-                        // Row 1: Slots 0-4 (relative to page)
-                        HorizontalLayout {
+                        VerticalLayout {
                             spacing: 10px;
-                            for i in [0, 1, 2, 3, 4]: SamplePad {
-                                sample: samples[start-slot + i];
-                                width: 140px;
-                                height: 130px;
-                                selected: selected-slot == samples[start-slot + i].slot;
-                                is-loading: loading-slot == samples[start-slot + i].slot;
-                                current-page: current-page;
-                                upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
-                                download-clicked => { download-clicked(samples[start-slot + i].slot); }
-                                delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
-                                pad-clicked => { pad-selected(samples[start-slot + i].slot); }
-                                name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
-                                save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
+
+                            // Row 1: Slots 0-4 (relative to page)
+                            HorizontalLayout {
+                                spacing: 10px;
+                                for i in [0, 1, 2, 3, 4]: SamplePad {
+                                    sample: samples[start-slot + i];
+                                    width: 140px;
+                                    height: 130px;
+                                    selected: selected-slot == samples[start-slot + i].slot;
+                                    is-loading: loading-slot == samples[start-slot + i].slot;
+                                    current-page: current-page;
+                                    upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
+                                    download-clicked => { download-clicked(samples[start-slot + i].slot); }
+                                    delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
+                                    pad-clicked => { pad-selected(samples[start-slot + i].slot); }
+                                    name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
+                                    save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
+                                }
+                            }
+
+                            // Row 2: Slots 5-9 (relative to page)
+                            HorizontalLayout {
+                                spacing: 10px;
+                                for i in [5, 6, 7, 8, 9]: SamplePad {
+                                    sample: samples[start-slot + i];
+                                    width: 140px;
+                                    height: 130px;
+                                    selected: selected-slot == samples[start-slot + i].slot;
+                                    is-loading: loading-slot == samples[start-slot + i].slot;
+                                    current-page: current-page;
+                                    upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
+                                    download-clicked => { download-clicked(samples[start-slot + i].slot); }
+                                    delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
+                                    pad-clicked => { pad-selected(samples[start-slot + i].slot); }
+                                    name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
+                                    save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
+                                }
                             }
                         }
 
-                        // Row 2: Slots 5-9 (relative to page)
-                        HorizontalLayout {
-                            spacing: 10px;
-                            for i in [5, 6, 7, 8, 9]: SamplePad {
-                                sample: samples[start-slot + i];
-                                width: 140px;
-                                height: 130px;
-                                selected: selected-slot == samples[start-slot + i].slot;
-                                is-loading: loading-slot == samples[start-slot + i].slot;
-                                current-page: current-page;
-                                upload-clicked => { upload-clicked(samples[start-slot + i].slot); }
-                                download-clicked => { download-clicked(samples[start-slot + i].slot); }
-                                delete-clicked => { delete-clicked(samples[start-slot + i].slot); }
-                                pad-clicked => { pad-selected(samples[start-slot + i].slot); }
-                                name-edit-accepted(new-name) => { name-edit-accepted(samples[start-slot + i].slot, new-name); }
-                                save-clicked => { save-to-device-clicked(samples[start-slot + i].slot); }
-                            }
+                        Rectangle {
+                            horizontal-stretch: 1;
                         }
                     }
                 }
